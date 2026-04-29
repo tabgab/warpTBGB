@@ -53,28 +53,11 @@ pub async fn generate_local_output(
     let request_id = Uuid::new_v4().to_string();
     let run_id = format!("local-{}", Uuid::new_v4());
 
-    // Pick a task ID — reuse the most recent existing task if any, otherwise new.
-    let task_id = params
-        .tasks
-        .iter()
-        .last()
-        .map(|t| t.id.clone())
-        .filter(|id| !id.is_empty())
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let task_description = params
-        .tasks
-        .iter()
-        .last()
-        .map(|t| t.description.clone())
-        .filter(|d| !d.is_empty())
-        .unwrap_or_else(|| user_query_summary(&params.input));
-
-    let response_message_id = Uuid::new_v4().to_string();
-
     // Stream events via an async channel so we can produce the ResponseStream type expected.
     let (tx, rx) = async_channel::unbounded::<super::Event>();
 
-    // 1. Emit StreamInit immediately.
+    // 1. Emit StreamInit immediately (even for failure cases — the UI needs
+    //    it to bind the stream id to the conversation).
     let init_event = api::ResponseEvent {
         r#type: Some(api::response_event::Type::Init(
             api::response_event::StreamInit {
@@ -86,6 +69,48 @@ pub async fn generate_local_output(
     };
     let _ = tx.send(Ok(init_event)).await;
 
+    // Pick the target task — MUST be an existing task in the conversation,
+    // because Warp pre-creates a task client-side before sending the request.
+    // Emitting CreateTask for a fresh UUID would orphan our messages (the
+    // conversation has the real task, not our fake one).
+    let task_id = params
+        .tasks
+        .iter()
+        .last()
+        .map(|t| t.id.clone())
+        .filter(|id| !id.is_empty());
+
+    let task_id = match task_id {
+        Some(id) => id,
+        None => {
+            log::warn!(
+                "Local inference: no existing task in params.tasks; cannot route response. \
+                 The caller did not pre-create a task for this request."
+            );
+            // Finish the stream gracefully so the UI doesn't hang.
+            let _ = tx
+                .send(Ok(api::ResponseEvent {
+                    r#type: Some(api::response_event::Type::Finished(
+                        api::response_event::StreamFinished {
+                            reason: Some(
+                                api::response_event::stream_finished::Reason::Other(
+                                    api::response_event::stream_finished::Other {},
+                                ),
+                            ),
+                            conversation_usage_metadata: None,
+                            token_usage: vec![],
+                            should_refresh_model_config: false,
+                            request_cost: None,
+                        },
+                    )),
+                }))
+                .await;
+            return Ok(Box::pin(rx));
+        }
+    };
+
+    let response_message_id = Uuid::new_v4().to_string();
+
     // 2. Kick off streaming generation on a background task.
     let tx_clone = tx.clone();
     let model_id_for_task = model_id_str.clone();
@@ -93,7 +118,6 @@ pub async fn generate_local_output(
     let api_keys = params.api_keys.clone();
     let ollama_url = params.ollama_url.clone();
     let task_id_for_spawn = task_id.clone();
-    let task_description_for_spawn = task_description.clone();
     let response_message_id_for_spawn = response_message_id.clone();
     let request_id_for_spawn = request_id.clone();
 
@@ -105,7 +129,6 @@ pub async fn generate_local_output(
             api_keys,
             ollama_url,
             task_id_for_spawn,
-            task_description_for_spawn,
             response_message_id_for_spawn,
             request_id_for_spawn,
             tx_clone,
@@ -125,7 +148,6 @@ pub async fn generate_local_output(
             api_keys,
             ollama_url,
             task_id_for_spawn,
-            task_description_for_spawn,
             response_message_id_for_spawn,
             request_id_for_spawn,
             cancellation_rx,
@@ -147,7 +169,6 @@ async fn run_local_inference(
     api_keys: Option<api::request::settings::ApiKeys>,
     ollama_url: Option<String>,
     task_id: String,
-    task_description: String,
     response_message_id: String,
     request_id: String,
     tx: async_channel::Sender<super::Event>,
@@ -164,33 +185,16 @@ async fn run_local_inference(
         return;
     }
 
-    // 2. CreateTask so UI has a task to append messages to.
-    let task_proto = api::Task {
-        id: task_id.clone(),
-        description: task_description,
-        dependencies: None,
-        messages: vec![],
-        summary: String::new(),
-        server_data: String::new(),
-    };
-    if tx
-        .send(Ok(wrap_actions(vec![api::client_action::Action::CreateTask(
-            api::client_action::CreateTask {
-                task: Some(task_proto),
-            },
-        )])))
-        .await
-        .is_err()
-    {
-        return;
-    }
-
-    // 3. Add an empty assistant message we'll append to.
+    // 2. Add an empty assistant message to the EXISTING task.
+    //    We do NOT emit CreateTask — the task already exists in the conversation
+    //    because Warp's client pre-creates it before sending the request. Emitting
+    //    CreateTask for our own fake id would orphan the message (TaskNotFound
+    //    when AddMessagesToTask runs, because our task_id doesn't exist yet).
     let initial_message = api::Message {
         id: response_message_id.clone(),
         task_id: task_id.clone(),
         request_id,
-        timestamp: None,
+        timestamp: Some(current_proto_timestamp()),
         server_message_data: String::new(),
         citations: vec![],
         message: Some(api::message::Message::AgentOutput(
@@ -492,16 +496,14 @@ fn extract_user_text(input: &[AIAgentInput]) -> String {
     String::new()
 }
 
-fn user_query_summary(input: &[AIAgentInput]) -> String {
-    let text = extract_user_text(input);
-    if text.is_empty() {
-        return "Local conversation".to_string();
-    }
-    let line = text.lines().next().unwrap_or(&text);
-    if line.len() > 80 {
-        format!("{}…", &line[..80])
-    } else {
-        line.to_string()
+fn current_proto_timestamp() -> prost_types::Timestamp {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    prost_types::Timestamp {
+        seconds: duration.as_secs() as i64,
+        nanos: duration.subsec_nanos() as i32,
     }
 }
 
