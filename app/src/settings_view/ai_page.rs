@@ -3244,7 +3244,7 @@ impl SettingsWidget for GlobalAIWidget {
 
     fn search_terms(&self) -> &str {
         "oz warp agent global ai a.i. active next command prompt code diffs suggestion suggested suggestions \
-                agent mode natural language detection input hint api keys bring your own byo google anthropic openai openrouter"
+                agent mode natural language detection input hint api keys bring your own byo google anthropic openai openrouter ollama"
     }
 
     fn render(
@@ -6276,6 +6276,7 @@ struct ApiKeysWidget {
     anthropic_api_key_editor: ViewHandle<EditorView>,
     google_api_key_editor: ViewHandle<EditorView>,
     open_router_api_key_editor: ViewHandle<EditorView>,
+    ollama_url_editor: ViewHandle<EditorView>,
 
     can_use_warp_credits_with_byok: SwitchStateHandle,
     upgrade_highlight_index: HighlightedHyperlink,
@@ -6293,6 +6294,7 @@ impl ApiKeysWidget {
             anthropic: anthropic_key,
             google: google_key,
             open_router: open_router_key,
+            ollama_url: ollama_url_value,
             ..
         } = ApiKeyManager::as_ref(ctx).keys().clone();
 
@@ -6386,12 +6388,19 @@ impl ApiKeysWidget {
             set_open_router_key,
             "sk-or-..."
         );
+        create_api_key_editor!(
+            ollama_url_editor,
+            ollama_url_value,
+            set_ollama_url,
+            "http://localhost:11434"
+        );
 
         Self {
             openai_api_key_editor,
             anthropic_api_key_editor,
             google_api_key_editor,
             open_router_api_key_editor,
+            ollama_url_editor,
 
             can_use_warp_credits_with_byok: Default::default(),
             upgrade_highlight_index: Default::default(),
@@ -6485,6 +6494,13 @@ impl ApiKeysWidget {
             appearance,
             "OpenRouter API Key",
             self.open_router_api_key_editor.clone(),
+            is_enabled,
+            app,
+        ));
+        column.add_child(render_api_key_input(
+            appearance,
+            "Ollama URL",
+            self.ollama_url_editor.clone(),
             is_enabled,
             app,
         ));
@@ -6584,7 +6600,7 @@ impl SettingsWidget for ApiKeysWidget {
     type View = AISettingsPageView;
 
     fn search_terms(&self) -> &str {
-        "api keys bring your own byo openai anthropic google openrouter claude gemini gpt"
+        "api keys bring your own byo openai anthropic google openrouter ollama claude gemini gpt"
     }
 
     fn render(

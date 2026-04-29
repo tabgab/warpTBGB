@@ -18,6 +18,7 @@ use crate::{
     server::server_api::ServerApiProvider,
     workspaces::user_workspaces::{UserWorkspaces, UserWorkspacesEvent},
 };
+use ai::{api_keys::ApiKeyManager, ollama_client::OllamaClient};
 
 use super::execution_profiles::profiles::AIExecutionProfilesModel;
 
@@ -102,7 +103,7 @@ impl LLMProvider {
             LLMProvider::Anthropic => Some(Icon::ClaudeLogo),
             LLMProvider::Google => Some(Icon::GeminiLogo),
             LLMProvider::Xai => None,
-            LLMProvider::Ollama => None, // TODO: Add Ollama icon
+            LLMProvider::Ollama => Some(Icon::OllamaLogo),
             LLMProvider::Unknown => None,
         }
     }
@@ -916,6 +917,93 @@ impl LLMPreferences {
             self.refresh_authed_models(ctx);
         } else {
             self.refresh_public_models(ctx);
+        }
+        // Also refresh Ollama models if configured
+        self.refresh_ollama_models(ctx);
+    }
+
+    /// Queries the local Ollama server for available models and merges them
+    /// into the agent mode model choices.
+    fn refresh_ollama_models(&self, ctx: &mut ModelContext<Self>) {
+        let ollama_url = match ApiKeyManager::as_ref(ctx).keys().ollama_url.clone() {
+            Some(url) if !url.is_empty() => url,
+            _ => return, // Ollama not configured — nothing to do
+        };
+
+        ctx.spawn(
+            async move {
+                let client = OllamaClient::with_base_url(&ollama_url);
+                client.available_model_names().await
+            },
+            |me, result, ctx| {
+                match result {
+                    Ok(model_names) if !model_names.is_empty() => {
+                        me.merge_ollama_models(model_names, ctx);
+                    }
+                    Ok(_) => {
+                        log::debug!("Ollama server returned no models");
+                    }
+                    Err(e) => {
+                        log::debug!("Failed to fetch Ollama models: {}", e);
+                    }
+                }
+            },
+        );
+    }
+
+    /// Converts Ollama model names to `LLMInfo` entries and merges them into
+    /// the agent mode choices, avoiding duplicates.
+    fn merge_ollama_models(&mut self, model_names: Vec<String>, ctx: &mut ModelContext<Self>) {
+        let existing_ids: HashSet<&LLMId> = self
+            .models_by_feature
+            .agent_mode
+            .choices
+            .iter()
+            .map(|info| &info.id)
+            .collect();
+
+        let new_models: Vec<LLMInfo> = model_names
+            .into_iter()
+            .filter(|name| {
+                let candidate_id = LLMId(name.clone());
+                !existing_ids.contains(&candidate_id)
+            })
+            .map(|name| {
+                let id = LLMId(name.clone());
+                LLMInfo {
+                    display_name: format!("Ollama: {}", name),
+                    base_model_name: name,
+                    id,
+                    reasoning_level: None,
+                    usage_metadata: LLMUsageMetadata {
+                        request_multiplier: 1,
+                        credit_multiplier: Some(0.0), // Free — no Warp credits consumed
+                    },
+                    description: Some("Locally hosted model via Ollama".to_string()),
+                    disable_reason: None,
+                    vision_supported: false,
+                    spec: Some(LLMSpec {
+                        cost: 0.0,
+                        quality: 0.7,
+                        speed: 0.8,
+                    }),
+                    provider: LLMProvider::Ollama,
+                    host_configs: HashMap::new(),
+                    discount_percentage: None,
+                    context_window: LLMContextWindow::default(),
+                }
+            })
+            .collect();
+
+        if !new_models.is_empty() {
+            self.models_by_feature.agent_mode.choices.extend(new_models);
+            // Also add to coding choices
+            self.models_by_feature.coding.choices = self
+                .models_by_feature
+                .agent_mode
+                .choices
+                .clone();
+            ctx.emit(LLMPreferencesEvent::UpdatedAvailableLLMs);
         }
     }
 
