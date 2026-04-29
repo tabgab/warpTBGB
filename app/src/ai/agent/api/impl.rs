@@ -14,6 +14,15 @@ pub async fn generate_multi_agent_output(
     mut params: RequestParams,
     cancellation_rx: futures::channel::oneshot::Receiver<()>,
 ) -> Result<ResponseStream, ConvertToAPITypeError> {
+    // TBGB: intercept local-model requests before building the server-bound proto.
+    // Local models (Ollama / OpenRouter BYOK) never round-trip through api.warp.dev.
+    {
+        let model_id_str: String = params.model.clone().into();
+        if super::local_inference::is_local_model(&model_id_str) {
+            return super::local_inference::generate_local_output(params, cancellation_rx).await;
+        }
+    }
+
     let supported_tools = params
         .supported_tools_override
         .take()

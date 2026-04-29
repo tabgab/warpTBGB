@@ -559,6 +559,12 @@ impl LLMPreferences {
             }
         });
 
+        // TBGB: Refresh Ollama models when API keys / Ollama URL change.
+        // ApiKeyManagerEvent has a single variant (KeysUpdated); any event triggers refresh.
+        ctx.subscribe_to_model(&ApiKeyManager::handle(ctx), |me, _event, ctx| {
+            me.refresh_ollama_models(ctx);
+        });
+
         let base_llm_for_terminal_view = HashMap::new();
 
         let me = Self {
@@ -954,25 +960,26 @@ impl LLMPreferences {
     /// Converts Ollama model names to `LLMInfo` entries and merges them into
     /// the agent mode choices, avoiding duplicates.
     fn merge_ollama_models(&mut self, model_names: Vec<String>, ctx: &mut ModelContext<Self>) {
-        let existing_ids: HashSet<&LLMId> = self
+        let existing_ids: HashSet<LLMId> = self
             .models_by_feature
             .agent_mode
             .choices
             .iter()
-            .map(|info| &info.id)
+            .map(|info| info.id.clone())
             .collect();
 
         let new_models: Vec<LLMInfo> = model_names
             .into_iter()
-            .filter(|name| {
-                let candidate_id = LLMId(name.clone());
-                !existing_ids.contains(&candidate_id)
-            })
-            .map(|name| {
-                let id = LLMId(name.clone());
-                LLMInfo {
-                    display_name: format!("Ollama: {}", name),
-                    base_model_name: name,
+            .filter_map(|name| {
+                // TBGB: prefix with "ollama:" so the local intercept can recognize it
+                // and route the request to the local Ollama server instead of api.warp.dev.
+                let id: LLMId = format!("ollama:{name}").into();
+                if existing_ids.contains(&id) {
+                    return None;
+                }
+                Some(LLMInfo {
+                    display_name: format!("Ollama: {name}"),
+                    base_model_name: name.clone(),
                     id,
                     reasoning_level: None,
                     usage_metadata: LLMUsageMetadata {
@@ -991,7 +998,7 @@ impl LLMPreferences {
                     host_configs: HashMap::new(),
                     discount_percentage: None,
                     context_window: LLMContextWindow::default(),
-                }
+                })
             })
             .collect();
 
@@ -1003,6 +1010,14 @@ impl LLMPreferences {
                 .agent_mode
                 .choices
                 .clone();
+
+            // TBGB: persist the merged list so Ollama models survive app restarts.
+            if let Ok(serialized) = serde_json::to_string(&self.models_by_feature) {
+                let _ = ctx
+                    .private_user_preferences()
+                    .write_value(MODELS_BY_FEATURE_CACHE_KEY, serialized);
+            }
+
             ctx.emit(LLMPreferencesEvent::UpdatedAvailableLLMs);
         }
     }
@@ -1113,6 +1128,9 @@ impl LLMPreferences {
         }
 
         ctx.emit(LLMPreferencesEvent::UpdatedAvailableLLMs);
+
+        // TBGB: Re-merge Ollama models after server response overwrites the list.
+        self.refresh_ollama_models(ctx);
     }
 
     pub fn vision_supported(&self, app: &AppContext, terminal_view_id: Option<EntityId>) -> bool {

@@ -364,15 +364,15 @@ pub trait MessageExt {
 
 impl MessageExt for ChatMessage {
     fn user(content: impl Into<String>) -> ChatMessage {
-        Self::message("user", content)
+        OllamaClient::message("user", content)
     }
 
     fn assistant(content: impl Into<String>) -> ChatMessage {
-        Self::message("assistant", content)
+        OllamaClient::message("assistant", content)
     }
 
     fn system(content: impl Into<String>) -> ChatMessage {
-        Self::message("system", content)
+        OllamaClient::message("system", content)
     }
 }
 

@@ -2,6 +2,7 @@ pub(crate) mod convert_conversation;
 mod convert_from;
 mod convert_to;
 mod r#impl;
+pub mod local_inference;
 
 pub use ai::agent::convert::ConvertToAPITypeError;
 use ai::api_keys::ApiKeyManager;
@@ -117,6 +118,8 @@ pub struct RequestParams {
 
     /// User-provided API keys for AI providers (BYO API Key).
     pub api_keys: Option<warp_multi_agent_api::request::settings::ApiKeys>,
+    /// TBGB: Ollama base URL for local inference (not part of the proto).
+    pub ollama_url: Option<String>,
     pub allow_use_of_warp_credits_with_byok: bool,
     pub autonomy_level: warp_multi_agent_api::AutonomyLevel,
     pub isolation_level: warp_multi_agent_api::IsolationLevel,
@@ -321,6 +324,8 @@ impl RequestParams {
             planning_enabled: true,
             should_redact_secrets,
             api_keys,
+            // TBGB: propagate Ollama URL for local inference routing
+            ollama_url: ApiKeyManager::as_ref(app).keys().ollama_url.clone(),
             allow_use_of_warp_credits_with_byok,
             autonomy_level,
             isolation_level,

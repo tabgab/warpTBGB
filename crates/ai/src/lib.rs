@@ -3,6 +3,7 @@ pub mod api_keys;
 pub mod aws_credentials;
 pub mod llm_id;
 pub mod ollama_client;
+pub mod openrouter_client;
 
 pub use llm_id::LLMId;
 pub mod diff_validation;
