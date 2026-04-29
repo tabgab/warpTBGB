@@ -22,6 +22,8 @@ pub struct ApiKeys {
     pub anthropic: Option<String>,
     pub openai: Option<String>,
     pub open_router: Option<String>,
+    /// Ollama URL (e.g., "http://localhost:11434"). No API key needed.
+    pub ollama_url: Option<String>,
 }
 
 impl ApiKeys {
@@ -30,6 +32,7 @@ impl ApiKeys {
             || self.anthropic.is_some()
             || self.google.is_some()
             || self.open_router.is_some()
+            || self.ollama_url.is_some()
     }
 }
 
@@ -89,6 +92,12 @@ impl ApiKeyManager {
 
     pub fn set_open_router_key(&mut self, key: Option<String>, ctx: &mut ModelContext<Self>) {
         self.keys.open_router = key;
+        ctx.emit(ApiKeyManagerEvent::KeysUpdated);
+        self.write_keys_to_secure_storage(ctx);
+    }
+
+    pub fn set_ollama_url(&mut self, url: Option<String>, ctx: &mut ModelContext<Self>) {
+        self.keys.ollama_url = url;
         ctx.emit(ApiKeyManagerEvent::KeysUpdated);
         self.write_keys_to_secure_storage(ctx);
     }
