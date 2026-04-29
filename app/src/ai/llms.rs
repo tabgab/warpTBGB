@@ -18,7 +18,9 @@ use crate::{
     server::server_api::ServerApiProvider,
     workspaces::user_workspaces::{UserWorkspaces, UserWorkspacesEvent},
 };
-use ai::{api_keys::ApiKeyManager, ollama_client::OllamaClient};
+use ai::{
+    api_keys::ApiKeyManager, ollama_client::OllamaClient, openrouter_client::OpenRouterClient,
+};
 
 use super::execution_profiles::profiles::AIExecutionProfilesModel;
 
@@ -559,10 +561,11 @@ impl LLMPreferences {
             }
         });
 
-        // TBGB: Refresh Ollama models when API keys / Ollama URL change.
+        // TBGB: Refresh local-inference models when API keys / URLs change.
         // ApiKeyManagerEvent has a single variant (KeysUpdated); any event triggers refresh.
         ctx.subscribe_to_model(&ApiKeyManager::handle(ctx), |me, _event, ctx| {
             me.refresh_ollama_models(ctx);
+            me.refresh_openrouter_models(ctx);
         });
 
         let base_llm_for_terminal_view = HashMap::new();
@@ -924,8 +927,9 @@ impl LLMPreferences {
         } else {
             self.refresh_public_models(ctx);
         }
-        // Also refresh Ollama models if configured
+        // Also refresh Ollama + OpenRouter models if configured
         self.refresh_ollama_models(ctx);
+        self.refresh_openrouter_models(ctx);
     }
 
     /// Queries the local Ollama server for available models and merges them
@@ -1012,6 +1016,115 @@ impl LLMPreferences {
                 .clone();
 
             // TBGB: persist the merged list so Ollama models survive app restarts.
+            if let Ok(serialized) = serde_json::to_string(&self.models_by_feature) {
+                let _ = ctx
+                    .private_user_preferences()
+                    .write_value(MODELS_BY_FEATURE_CACHE_KEY, serialized);
+            }
+
+            ctx.emit(LLMPreferencesEvent::UpdatedAvailableLLMs);
+        }
+    }
+
+    /// TBGB: Queries OpenRouter for available models and merges them into
+    /// the agent mode choices. Requires an API key in ApiKeyManager.
+    fn refresh_openrouter_models(&self, ctx: &mut ModelContext<Self>) {
+        let api_key = match ApiKeyManager::as_ref(ctx).keys().open_router.clone() {
+            Some(k) if !k.is_empty() => k,
+            _ => return, // OpenRouter not configured
+        };
+
+        ctx.spawn(
+            async move {
+                let client = OpenRouterClient::new(api_key);
+                client.list_models().await
+            },
+            |me, result, ctx| match result {
+                Ok(models) if !models.is_empty() => {
+                    let entries: Vec<(String, Option<String>, Option<u64>)> = models
+                        .into_iter()
+                        .map(|m| (m.id, m.name, m.context_length))
+                        .collect();
+                    me.merge_openrouter_models(entries, ctx);
+                }
+                Ok(_) => {
+                    log::debug!("OpenRouter returned no models");
+                }
+                Err(e) => {
+                    log::warn!("Failed to fetch OpenRouter models: {e}");
+                }
+            },
+        );
+    }
+
+    /// TBGB: Converts OpenRouter model entries to `LLMInfo` and merges them in.
+    /// Entry: (slug, display_name_opt, context_length_opt).
+    fn merge_openrouter_models(
+        &mut self,
+        models: Vec<(String, Option<String>, Option<u64>)>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let existing_ids: HashSet<LLMId> = self
+            .models_by_feature
+            .agent_mode
+            .choices
+            .iter()
+            .map(|info| info.id.clone())
+            .collect();
+
+        let new_models: Vec<LLMInfo> = models
+            .into_iter()
+            .filter_map(|(slug, display, ctx_len)| {
+                let id: LLMId = format!("openrouter:{slug}").into();
+                if existing_ids.contains(&id) {
+                    return None;
+                }
+                let display_name = display
+                    .filter(|s| !s.is_empty())
+                    .map(|d| format!("OpenRouter: {d}"))
+                    .unwrap_or_else(|| format!("OpenRouter: {slug}"));
+                let max_ctx = ctx_len.unwrap_or(0).min(u32::MAX as u64) as u32;
+                Some(LLMInfo {
+                    display_name,
+                    base_model_name: slug.clone(),
+                    id,
+                    reasoning_level: None,
+                    usage_metadata: LLMUsageMetadata {
+                        request_multiplier: 1,
+                        credit_multiplier: Some(0.0),
+                    },
+                    description: Some("Routed via OpenRouter (BYOK)".to_string()),
+                    disable_reason: None,
+                    vision_supported: false,
+                    spec: Some(LLMSpec {
+                        cost: 0.0,
+                        quality: 0.8,
+                        speed: 0.7,
+                    }),
+                    provider: LLMProvider::Unknown, // no OpenRouter variant in provider enum yet
+                    host_configs: HashMap::new(),
+                    discount_percentage: None,
+                    context_window: LLMContextWindow {
+                        is_configurable: max_ctx > 0,
+                        min: 0,
+                        max: max_ctx,
+                        default_max: max_ctx,
+                    },
+                })
+            })
+            .collect();
+
+        if !new_models.is_empty() {
+            self.models_by_feature
+                .agent_mode
+                .choices
+                .extend(new_models.clone());
+            self.models_by_feature.coding.choices = self
+                .models_by_feature
+                .agent_mode
+                .choices
+                .clone();
+
             if let Ok(serialized) = serde_json::to_string(&self.models_by_feature) {
                 let _ = ctx
                     .private_user_preferences()
@@ -1129,8 +1242,9 @@ impl LLMPreferences {
 
         ctx.emit(LLMPreferencesEvent::UpdatedAvailableLLMs);
 
-        // TBGB: Re-merge Ollama models after server response overwrites the list.
+        // TBGB: Re-merge Ollama + OpenRouter models after server response overwrites the list.
         self.refresh_ollama_models(ctx);
+        self.refresh_openrouter_models(ctx);
     }
 
     pub fn vision_supported(&self, app: &AppContext, terminal_view_id: Option<EntityId>) -> bool {
