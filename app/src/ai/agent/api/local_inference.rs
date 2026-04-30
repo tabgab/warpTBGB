@@ -69,44 +69,27 @@ pub async fn generate_local_output(
     };
     let _ = tx.send(Ok(init_event)).await;
 
-    // Pick the target task — MUST be an existing task in the conversation,
-    // because Warp pre-creates a task client-side before sending the request.
-    // Emitting CreateTask for a fresh UUID would orphan our messages (the
-    // conversation has the real task, not our fake one).
-    let task_id = params
+    // Determine whether this is turn 1 (no server-authoritative task yet)
+    // or a continuation (server task already in params.tasks).
+    //
+    // compute_active_tasks() in AIConversation filters to only server-upgraded
+    // tasks via task.source()?. On turn 1 the root task is still optimistic,
+    // so params.tasks is EMPTY and we need to emit CreateTask to trigger the
+    // optimistic->server upgrade of the root task. On turn 2+ the root is
+    // already upgraded and present in params.tasks; emitting CreateTask again
+    // would fail (UpgradeOptimisticTaskError::UnexpectedUpgrade from
+    // into_server_created_task) and mangle added_exchanges_by_response,
+    // producing the TaskNotFound error on the subsequent AddMessagesToTask.
+    let existing_server_task_id = params
         .tasks
         .iter()
         .last()
         .map(|t| t.id.clone())
         .filter(|id| !id.is_empty());
 
-    let task_id = match task_id {
-        Some(id) => id,
-        None => {
-            log::warn!(
-                "Local inference: no existing task in params.tasks; cannot route response. \
-                 The caller did not pre-create a task for this request."
-            );
-            // Finish the stream gracefully so the UI doesn't hang.
-            let _ = tx
-                .send(Ok(api::ResponseEvent {
-                    r#type: Some(api::response_event::Type::Finished(
-                        api::response_event::StreamFinished {
-                            reason: Some(
-                                api::response_event::stream_finished::Reason::Other(
-                                    api::response_event::stream_finished::Other {},
-                                ),
-                            ),
-                            conversation_usage_metadata: None,
-                            token_usage: vec![],
-                            should_refresh_model_config: false,
-                            request_cost: None,
-                        },
-                    )),
-                }))
-                .await;
-            return Ok(Box::pin(rx));
-        }
+    let (task_id, needs_create_task) = match existing_server_task_id {
+        Some(id) => (id, false),
+        None => (Uuid::new_v4().to_string(), true),
     };
 
     let response_message_id = Uuid::new_v4().to_string();
@@ -129,6 +112,7 @@ pub async fn generate_local_output(
             api_keys,
             ollama_url,
             task_id_for_spawn,
+            needs_create_task,
             response_message_id_for_spawn,
             request_id_for_spawn,
             tx_clone,
@@ -148,6 +132,7 @@ pub async fn generate_local_output(
             api_keys,
             ollama_url,
             task_id_for_spawn,
+            needs_create_task,
             response_message_id_for_spawn,
             request_id_for_spawn,
             cancellation_rx,
@@ -169,6 +154,7 @@ async fn run_local_inference(
     api_keys: Option<api::request::settings::ApiKeys>,
     ollama_url: Option<String>,
     task_id: String,
+    needs_create_task: bool,
     response_message_id: String,
     request_id: String,
     tx: async_channel::Sender<super::Event>,
@@ -185,11 +171,34 @@ async fn run_local_inference(
         return;
     }
 
-    // 2. Add an empty assistant message to the EXISTING task.
-    //    We do NOT emit CreateTask — the task already exists in the conversation
-    //    because Warp's client pre-creates it before sending the request. Emitting
-    //    CreateTask for our own fake id would orphan the message (TaskNotFound
-    //    when AddMessagesToTask runs, because our task_id doesn't exist yet).
+    // 2. CreateTask only on turn 1, to upgrade the optimistic root task id
+    //    to our deterministic one. On subsequent turns, params.tasks already
+    //    contains a server-upgraded task; emitting CreateTask again would
+    //    hit UpgradeOptimisticTaskError::UnexpectedUpgrade and corrupt the
+    //    conversation's pending-exchange state.
+    if needs_create_task {
+        let task_proto = api::Task {
+            id: task_id.clone(),
+            description: String::new(),
+            dependencies: None,
+            messages: vec![],
+            summary: String::new(),
+            server_data: String::new(),
+        };
+        if tx
+            .send(Ok(wrap_actions(vec![
+                api::client_action::Action::CreateTask(api::client_action::CreateTask {
+                    task: Some(task_proto),
+                }),
+            ])))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+
+    // 3. Add an empty assistant message to the task.
     let initial_message = api::Message {
         id: response_message_id.clone(),
         task_id: task_id.clone(),

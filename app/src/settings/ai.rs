@@ -1497,13 +1497,19 @@ impl AISettings {
     }
 
     pub fn is_any_ai_enabled(&self, app: &AppContext) -> bool {
-        // Disable AI for anonymous and logged-out users.
+        // TBGB: Allow AI for anonymous/logged-out users if they have a BYOK
+        // key configured (Ollama URL, OpenRouter, etc.). Upstream Warp gates
+        // AI behind login; we relax it when the user brings their own keys.
         let is_anonymous_or_logged_out = AuthStateProvider::as_ref(app)
             .get()
             .is_anonymous_or_logged_out();
 
+        let has_any_byo_key = ai::api_keys::ApiKeyManager::as_ref(app)
+            .keys()
+            .has_any_key();
+
         *self.is_any_ai_enabled
-            && !is_anonymous_or_logged_out
+            && (!is_anonymous_or_logged_out || has_any_byo_key)
             && !self.is_ai_disabled_due_to_remote_session_org_policy(app)
     }
 
