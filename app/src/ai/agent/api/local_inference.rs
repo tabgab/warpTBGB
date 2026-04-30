@@ -474,11 +474,25 @@ fn openrouter_tool_calls_to_proto_messages(
         .iter()
         .filter_map(|tc| {
             // OpenRouter/OpenAI: arguments is already a JSON string.
+            log::debug!(
+                "Local inference: model emitted tool call '{}' with args: {}",
+                tc.function.name,
+                tc.function.arguments
+            );
             let proto_tc = local_tools::into_proto_tool_call(
                 tc.id.clone(),
                 &tc.function.name,
                 &tc.function.arguments,
-            )?;
+            );
+            if proto_tc.is_none() {
+                log::warn!(
+                    "Local inference: could not translate tool call '{}' — \
+                     unknown function name or malformed arguments. Args: {}",
+                    tc.function.name,
+                    tc.function.arguments
+                );
+            }
+            let proto_tc = proto_tc?;
             Some(api::Message {
                 id: Uuid::new_v4().to_string(),
                 task_id: task_id.to_string(),
@@ -535,16 +549,36 @@ fn append_action(
 
 fn build_system_prompt() -> String {
     r#"You are a helpful AI coding assistant running inside the Warp terminal.
-You can use the provided tools (run_shell_command, read_files, grep, file_glob)
-to inspect the user's project, run commands, and carry out tasks on their
-behalf. Prefer issuing tool calls over describing what you would do — the user
-wants actions, not explanations.
+
+You have the following tools:
+
+  - run_shell_command: Run a shell command and see its output. Use this to
+    execute code, inspect the environment, or gather information.
+  - read_files: Read the contents of one or more files.
+  - grep: Search file contents for a pattern.
+  - file_glob: Find files by glob pattern.
+  - apply_file_diffs: CREATE NEW FILES, edit existing files, or delete files.
+    USE THIS TOOL WHENEVER THE USER ASKS YOU TO WRITE CODE. Do NOT use
+    run_shell_command with `cat > file <<EOF ...` or `echo > file` to write
+    code; always use apply_file_diffs instead, which shows the user a proper
+    diff preview.
+
+Workflow for code-writing tasks:
+  1. If you need to understand existing code, use read_files / grep first.
+  2. Write or modify code by calling apply_file_diffs with the `new_files`
+     and/or `edits` arrays populated. Each new_files entry must have a
+     non-empty `content` field with the full file contents.
+  3. After applying diffs, optionally run_shell_command to verify (e.g.
+     compile, test, or execute the result).
+  4. When the task is complete, respond with plain text summarizing what
+     you did. No more tool calls needed.
 
 Tool call guidelines:
-- Set is_read_only=true on run_shell_command for safe, non-mutating commands.
-- Be concise. Don't repeat tool output back verbatim in your reply.
-- When you have enough information to answer, respond with plain text and no
-  tool calls.
+  - Set is_read_only=true on run_shell_command for safe, non-mutating
+    commands (ls, cat, git status, etc.).
+  - Be concise. Don't repeat full tool output back verbatim in your reply.
+  - Never invent file contents — if the user asks for new code, fully
+    specify its contents in an apply_file_diffs.new_files entry.
 "#
     .to_string()
 }
@@ -794,9 +828,124 @@ fn proto_tool_call_to_name_args(tc: &api::message::ToolCall) -> (String, String)
 }
 
 fn stringify_tool_call_result(tcr: &api::message::ToolCallResult) -> String {
-    // The proto type isn't Serialize; use Debug formatting which is enough for
-    // the model to see the structure and key fields.
-    format!("{tcr:?}")
+    // Produce a clean, model-readable summary for each tool-result variant,
+    // mirroring what Warp's conversation_yaml.rs does for its own search
+    // serialization. The raw proto Debug dump is unreadable; this is what the
+    // model sees when replaying prior turns' tool calls on turn 3+.
+    use api::message::tool_call_result::Result as R;
+    let Some(result) = tcr.result.as_ref() else {
+        return "(no result)".to_string();
+    };
+    match result {
+        R::RunShellCommand(r) => {
+            if let Some(res) = &r.result {
+                use api::run_shell_command_result::Result as RR;
+                match res {
+                    RR::CommandFinished(c) => format!(
+                        "exit_code: {}\noutput:\n{}",
+                        c.exit_code,
+                        truncate(&c.output, 8192)
+                    ),
+                    RR::LongRunningCommandSnapshot(s) => {
+                        format!("status: long_running\noutput:\n{}", truncate(&s.output, 8192))
+                    }
+                    RR::PermissionDenied(_) => "status: permission_denied".to_string(),
+                }
+            } else {
+                "(empty shell result)".to_string()
+            }
+        }
+        R::ReadFiles(r) => {
+            if let Some(res) = &r.result {
+                use api::read_files_result::Result as RR;
+                match res {
+                    RR::TextFilesSuccess(s) => {
+                        let mut out = String::new();
+                        for f in &s.files {
+                            out.push_str(&format!("--- {} ---\n{}\n", f.file_path, f.content));
+                        }
+                        if out.is_empty() {
+                            "(no files returned)".to_string()
+                        } else {
+                            out
+                        }
+                    }
+                    RR::AnyFilesSuccess(s) => {
+                        format!("{} file(s) returned (non-text / binary)", s.files.len())
+                    }
+                    RR::Error(e) => format!("error: {}", e.message),
+                }
+            } else {
+                "(empty read_files result)".to_string()
+            }
+        }
+        R::Grep(r) => {
+            if let Some(res) = &r.result {
+                use api::grep_result::Result as RR;
+                match res {
+                    RR::Success(s) => {
+                        let mut out = String::from("matched_files:\n");
+                        for f in &s.matched_files {
+                            out.push_str(&format!("  - {}\n", f.file_path));
+                            for line in &f.matched_lines {
+                                out.push_str(&format!("      line {}\n", line.line_number));
+                            }
+                        }
+                        out
+                    }
+                    RR::Error(e) => format!("error: {}", e.message),
+                }
+            } else {
+                "(empty grep result)".to_string()
+            }
+        }
+        R::FileGlobV2(r) => {
+            if let Some(res) = &r.result {
+                use api::file_glob_v2_result::Result as RR;
+                match res {
+                    RR::Success(s) => {
+                        let paths: Vec<&str> =
+                            s.matched_files.iter().map(|f| f.file_path.as_str()).collect();
+                        format!("matching paths:\n{}", paths.join("\n"))
+                    }
+                    RR::Error(e) => format!("error: {}", e.message),
+                }
+            } else {
+                "(empty glob result)".to_string()
+            }
+        }
+        R::ApplyFileDiffs(r) => {
+            if let Some(res) = &r.result {
+                use api::apply_file_diffs_result::Result as RR;
+                match res {
+                    RR::Success(s) => {
+                        let mut out = String::from("status: success\n");
+                        for uf in &s.updated_files_v2 {
+                            if let Some(f) = &uf.file {
+                                out.push_str(&format!("  updated: {}\n", f.file_path));
+                            }
+                        }
+                        for df in &s.deleted_files {
+                            out.push_str(&format!("  deleted: {}\n", df.file_path));
+                        }
+                        out
+                    }
+                    RR::Error(e) => format!("error: {}", e.message),
+                }
+            } else {
+                "(empty apply_file_diffs result)".to_string()
+            }
+        }
+        other => format!("{other:?}"),
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() > max {
+        format!("{}\n... (truncated, {} bytes total)", &s[..max], s.len())
+    } else {
+        s.to_string()
+    }
 }
 
 fn current_proto_timestamp() -> prost_types::Timestamp {

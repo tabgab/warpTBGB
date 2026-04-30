@@ -313,8 +313,14 @@ pub fn into_proto_tool_call(
                         .collect()
                 })
                 .unwrap_or_default();
-            // All three lists empty -> nothing to do; reject so model retries.
+            // All three lists empty -> nothing to do; reject so the model
+            // knows (via absent tool output -> provider error) it needs to
+            // populate content.
             if new_files.is_empty() && diffs.is_empty() && deleted_files.is_empty() {
+                log::warn!(
+                    "Local inference: model called apply_file_diffs with empty \
+                     new_files/edits/deleted_files. Raw args were: {args}"
+                );
                 return None;
             }
             Some(api::message::tool_call::Tool::ApplyFileDiffs(
