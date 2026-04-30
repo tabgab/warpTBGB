@@ -325,9 +325,13 @@ async fn run_ollama(
     let tool_defs = local_tools::ollama_tool_defs();
     let messages = chat_messages.into_iter().map(to_ollama_message).collect();
 
-    let stream = client
-        .chat_streaming(bare_model, messages, tool_defs)
-        .await?;
+    let stream = match client.chat_streaming(bare_model, messages, tool_defs).await {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("run_ollama: chat_streaming failed before first chunk: {e}");
+            return Err(anyhow!("ollama request failed: {e}"));
+        }
+    };
     let mut stream = Box::pin(stream);
 
     let mut total_text_len: usize = 0;

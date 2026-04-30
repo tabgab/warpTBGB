@@ -16,7 +16,12 @@ pub use crate::llm_id::LLMId;
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 
 /// Default request timeout for Ollama API calls.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
+///
+/// Set to 10 minutes: local models on mid-range laptops can take 2-5 minutes
+/// to produce a first token when a large model (e.g. qwen3:27b) has been
+/// evicted from RAM and needs reloading between turns. The prior 120s default
+/// caused silent failures mid-conversation.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// A message in an Ollama chat conversation.
 ///
@@ -392,12 +397,28 @@ impl OllamaClient {
             log::debug!("  tool[{}] name={}", i, tool.function.name);
         }
 
-        let response = self
+        let response = match self
             .http_client
             .post(format!("{}/api/chat", self.base_url))
             .json(&request)
             .send()
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                log::error!(
+                    "ollama chat_streaming POST failed: timeout={} connect={} request={} body={} status={:?} url={}/api/chat err={}",
+                    e.is_timeout(),
+                    e.is_connect(),
+                    e.is_request(),
+                    e.is_body(),
+                    e.status(),
+                    self.base_url,
+                    e,
+                );
+                return Err(OllamaError::ConnectionError(e));
+            }
+        };
 
         if !response.status().is_success() {
             let status = response.status();
