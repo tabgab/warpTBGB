@@ -348,6 +348,7 @@ impl OpenRouterClient {
             // Accumulators for in-flight tool calls, keyed by OpenAI's stream index.
             let mut tool_accum: std::collections::BTreeMap<u32, ToolCallAccum> =
                 std::collections::BTreeMap::new();
+            let mut saw_finish = false;
 
             while let Some(chunk) = bytes_stream.next().await {
                 match chunk {
@@ -361,7 +362,13 @@ impl OpenRouterClient {
                             };
                             if data.trim() == "[DONE]" {
                                 // Flush any remaining tool calls.
-                                for (_, acc) in std::mem::take(&mut tool_accum) {
+                                for (idx, acc) in std::mem::take(&mut tool_accum) {
+                                    log::debug!(
+                                        "openrouter stream: finalizing tool call index={} name={:?} args={}",
+                                        idx,
+                                        acc.name,
+                                        acc.arguments,
+                                    );
                                     if let Some(tc) = acc.into_tool_call() {
                                         yield Ok(StreamEvent::ToolCallComplete(tc));
                                     }
@@ -378,22 +385,54 @@ impl OpenRouterClient {
                                     }
                                     for tcd in &choice.delta.tool_calls {
                                         let acc = tool_accum.entry(tcd.index).or_default();
-                                        if let Some(id) = &tcd.id { acc.id = Some(id.clone()); }
-                                        if let Some(t) = &tcd.call_type { acc.call_type = t.clone(); }
+                                        if let Some(id) = &tcd.id {
+                                            if !id.is_empty() {
+                                                acc.id = Some(id.clone());
+                                            }
+                                        }
+                                        if let Some(t) = &tcd.call_type {
+                                            if !t.is_empty() {
+                                                acc.call_type = t.clone();
+                                            }
+                                        }
                                         if let Some(func) = &tcd.function {
-                                            if let Some(name) = &func.name { acc.name = Some(name.clone()); }
-                                            if let Some(args) = &func.arguments { acc.arguments.push_str(args); }
+                                            if let Some(name) = &func.name {
+                                                if !name.is_empty() {
+                                                    acc.name = Some(name.clone());
+                                                }
+                                            }
+                                            // arguments chunks are additive strings
+                                            if let Some(args) = &func.arguments {
+                                                acc.arguments.push_str(args);
+                                            }
                                         }
                                     }
-                                    // OpenAI signals end-of-tool-calls via finish_reason: "tool_calls".
                                     if let Some(reason) = &choice.finish_reason {
-                                        if reason == "tool_calls" || reason == "stop" {
-                                            for (_, acc) in std::mem::take(&mut tool_accum) {
+                                        log::debug!(
+                                            "openrouter stream: finish_reason={}, {} tool_call(s) accumulated",
+                                            reason,
+                                            tool_accum.len()
+                                        );
+                                        saw_finish = true;
+                                        if reason == "tool_calls" {
+                                            // Definitive end-of-tool-calls. Flush.
+                                            for (idx, acc) in std::mem::take(&mut tool_accum) {
+                                                log::debug!(
+                                                    "openrouter stream: finalizing tool call index={} name={:?} args_len={} args={}",
+                                                    idx,
+                                                    acc.name,
+                                                    acc.arguments.len(),
+                                                    acc.arguments,
+                                                );
                                                 if let Some(tc) = acc.into_tool_call() {
                                                     yield Ok(StreamEvent::ToolCallComplete(tc));
                                                 }
                                             }
                                         }
+                                        // Don't flush on "stop" here — that's end of a
+                                        // text-only turn, and tool_accum should already
+                                        // be empty. If it isn't, we'll flush at stream
+                                        // close below.
                                     }
                                 }
                                 Err(e) => {
@@ -409,7 +448,15 @@ impl OpenRouterClient {
                 }
             }
             // Stream ended without [DONE]; flush whatever's accumulated.
-            for (_, acc) in std::mem::take(&mut tool_accum) {
+            let _ = saw_finish;
+            for (idx, acc) in std::mem::take(&mut tool_accum) {
+                log::debug!(
+                    "openrouter stream: end-of-stream flush tool call index={} name={:?} args_len={} args={}",
+                    idx,
+                    acc.name,
+                    acc.arguments.len(),
+                    acc.arguments,
+                );
                 if let Some(tc) = acc.into_tool_call() {
                     yield Ok(StreamEvent::ToolCallComplete(tc));
                 }
