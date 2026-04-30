@@ -3,48 +3,49 @@
 //! When the user selects a model whose ID is prefixed with `ollama:` or `openrouter:`,
 //! this module handles the request locally instead of sending it to Warp's server.
 //!
-//! The local client speaks OpenAI chat-completions protocol (for OpenRouter) or
-//! Ollama's native chat protocol, and translates streaming output back into the
-//! `warp_multi_agent_api::ResponseEvent` stream that the rest of Warp consumes.
-//!
-//! LIMITATIONS:
-//! - No tool calls. The model sees the user prompt + conversation history only.
-//!   Tool routing is out of scope for this phase.
-//! - No agent orchestration, no ambient/cloud tasks, no artifact storage.
+//! Supports OpenAI-format tool calling:
+//! - Turn 1: send user prompt + tool schemas; if model responds with tool_calls,
+//!   emit them as proto Message::ToolCall actions, which Warp's existing
+//!   executors will handle (preprocessing / approval UI / execution).
+//! - Turn N: receive AIAgentInput::ActionResult entries in params.input,
+//!   translate to OpenAI-format tool-role chat messages, send back to model.
+//! - Warp's `send_follow_up_for_conversation` automatically triggers turn N
+//!   after tool results are collected, so the loop runs without special plumbing.
 
 use anyhow::anyhow;
 use futures::StreamExt;
 use uuid::Uuid;
 use warp_multi_agent_api as api;
 
+use super::local_tools;
+use super::ConvertToAPITypeError;
 use super::{RequestParams, ResponseStream};
 use crate::ai::agent::AIAgentInput;
-use super::ConvertToAPITypeError;
-use ai::ollama_client::{ChatMessage as OllamaMessage, OllamaClient};
-use ai::openrouter_client::{ChatMessage as OpenRouterMessage, OpenRouterClient};
+use ai::ollama_client::{
+    self as ollama, ChatMessage as OllamaMessage, FunctionCall as OllamaFunctionCall,
+    OllamaClient, ToolCall as OllamaToolCall,
+};
+use ai::openrouter_client::{
+    ChatMessage as OpenRouterMessage, FunctionCall as OpenRouterFunctionCall, OpenRouterClient,
+    StreamEvent as OpenRouterStreamEvent, ToolCall as OpenRouterToolCall,
+};
 
-/// Prefix that marks an Ollama-provided model in our LLMId namespace.
 pub const OLLAMA_ID_PREFIX: &str = "ollama:";
-
-/// Prefix that marks an OpenRouter-provided model in our LLMId namespace.
 pub const OPENROUTER_ID_PREFIX: &str = "openrouter:";
 
-/// Returns true if this model ID should be routed through local inference.
 pub fn is_local_model(model_id: &str) -> bool {
     model_id.starts_with(OLLAMA_ID_PREFIX) || model_id.starts_with(OPENROUTER_ID_PREFIX)
 }
 
-/// Entry point: handle a request locally and return a ResponseStream.
 pub async fn generate_local_output(
     params: RequestParams,
     cancellation_rx: futures::channel::oneshot::Receiver<()>,
 ) -> Result<ResponseStream, ConvertToAPITypeError> {
     let model_id_str: String = params.model.clone().into();
 
-    let system_prompt = build_system_prompt();
-    let messages = build_chat_messages(&system_prompt, &params.tasks, &params.input);
+    let chat_messages = build_chat_messages(&params);
 
-    // Generate stable IDs for this local exchange.
+    // Stable conversation / request / run ids for this turn.
     let conversation_id = params
         .conversation_token
         .as_ref()
@@ -53,104 +54,78 @@ pub async fn generate_local_output(
     let request_id = Uuid::new_v4().to_string();
     let run_id = format!("local-{}", Uuid::new_v4());
 
-    // Stream events via an async channel so we can produce the ResponseStream type expected.
     let (tx, rx) = async_channel::unbounded::<super::Event>();
 
-    // 1. Emit StreamInit immediately (even for failure cases — the UI needs
-    //    it to bind the stream id to the conversation).
-    let init_event = api::ResponseEvent {
-        r#type: Some(api::response_event::Type::Init(
-            api::response_event::StreamInit {
-                conversation_id: conversation_id.clone(),
-                request_id: request_id.clone(),
-                run_id: run_id.clone(),
-            },
-        )),
-    };
-    let _ = tx.send(Ok(init_event)).await;
+    // Emit StreamInit immediately.
+    let _ = tx
+        .send(Ok(api::ResponseEvent {
+            r#type: Some(api::response_event::Type::Init(
+                api::response_event::StreamInit {
+                    conversation_id: conversation_id.clone(),
+                    request_id: request_id.clone(),
+                    run_id: run_id.clone(),
+                },
+            )),
+        }))
+        .await;
 
-    // Determine whether this is turn 1 (no server-authoritative task yet)
-    // or a continuation (server task already in params.tasks).
-    //
-    // compute_active_tasks() in AIConversation filters to only server-upgraded
-    // tasks via task.source()?. On turn 1 the root task is still optimistic,
-    // so params.tasks is EMPTY and we need to emit CreateTask to trigger the
-    // optimistic->server upgrade of the root task. On turn 2+ the root is
-    // already upgraded and present in params.tasks; emitting CreateTask again
-    // would fail (UpgradeOptimisticTaskError::UnexpectedUpgrade from
-    // into_server_created_task) and mangle added_exchanges_by_response,
-    // producing the TaskNotFound error on the subsequent AddMessagesToTask.
+    // Decide whether we still need CreateTask (turn 1 iff params.tasks is empty).
     let existing_server_task_id = params
         .tasks
         .iter()
         .last()
         .map(|t| t.id.clone())
         .filter(|id| !id.is_empty());
-
     let (task_id, needs_create_task) = match existing_server_task_id {
         Some(id) => (id, false),
         None => (Uuid::new_v4().to_string(), true),
     };
 
     let response_message_id = Uuid::new_v4().to_string();
-
-    // 2. Kick off streaming generation on a background task.
     let tx_clone = tx.clone();
-    let model_id_for_task = model_id_str.clone();
-    let messages_for_task = messages.clone();
     let api_keys = params.api_keys.clone();
     let ollama_url = params.ollama_url.clone();
-    let task_id_for_spawn = task_id.clone();
-    let response_message_id_for_spawn = response_message_id.clone();
-    let request_id_for_spawn = request_id.clone();
 
     #[cfg(not(target_family = "wasm"))]
-    let spawn = tokio::spawn(async move {
+    let _ = tokio::spawn(async move {
         run_local_inference(
-            model_id_for_task,
-            messages_for_task,
+            model_id_str,
+            chat_messages,
             api_keys,
             ollama_url,
-            task_id_for_spawn,
+            task_id,
             needs_create_task,
-            response_message_id_for_spawn,
-            request_id_for_spawn,
+            response_message_id,
+            request_id,
             tx_clone,
             cancellation_rx,
         )
         .await
     });
 
-    // On wasm we don't have a tokio runtime; run inline. Currently this module
-    // is not called in wasm paths but we guard anyway.
     #[cfg(target_family = "wasm")]
     {
         let _ = (
             tx_clone,
-            model_id_for_task,
-            messages_for_task,
+            model_id_str,
+            chat_messages,
             api_keys,
             ollama_url,
-            task_id_for_spawn,
+            task_id,
             needs_create_task,
-            response_message_id_for_spawn,
-            request_id_for_spawn,
+            response_message_id,
+            request_id,
             cancellation_rx,
         );
     }
 
-    #[cfg(not(target_family = "wasm"))]
-    let _ = spawn; // detached
-
-    // Return the receiver as the ResponseStream.
     Ok(Box::pin(rx))
 }
 
-/// The core generation loop.
 #[allow(clippy::too_many_arguments)]
 async fn run_local_inference(
     model_id_str: String,
-    messages: Vec<ChatMsg>,
+    chat_messages: Vec<ChatMsg>,
     api_keys: Option<api::request::settings::ApiKeys>,
     ollama_url: Option<String>,
     task_id: String,
@@ -160,22 +135,18 @@ async fn run_local_inference(
     tx: async_channel::Sender<super::Event>,
     mut cancellation_rx: futures::channel::oneshot::Receiver<()>,
 ) {
-    // 1. BeginTransaction
+    // BeginTransaction
     if tx
-        .send(Ok(wrap_actions(vec![api::client_action::Action::BeginTransaction(
-            api::client_action::BeginTransaction {},
-        )])))
+        .send(Ok(wrap_actions(vec![
+            api::client_action::Action::BeginTransaction(api::client_action::BeginTransaction {}),
+        ])))
         .await
         .is_err()
     {
         return;
     }
 
-    // 2. CreateTask only on turn 1, to upgrade the optimistic root task id
-    //    to our deterministic one. On subsequent turns, params.tasks already
-    //    contains a server-upgraded task; emitting CreateTask again would
-    //    hit UpgradeOptimisticTaskError::UnexpectedUpgrade and corrupt the
-    //    conversation's pending-exchange state.
+    // Turn 1 only: CreateTask to upgrade the optimistic root task.
     if needs_create_task {
         let task_proto = api::Task {
             id: task_id.clone(),
@@ -198,11 +169,11 @@ async fn run_local_inference(
         }
     }
 
-    // 3. Add an empty assistant message to the task.
+    // Initial empty assistant message for text streaming.
     let initial_message = api::Message {
         id: response_message_id.clone(),
         task_id: task_id.clone(),
-        request_id,
+        request_id: request_id.clone(),
         timestamp: Some(current_proto_timestamp()),
         server_message_data: String::new(),
         citations: vec![],
@@ -214,12 +185,10 @@ async fn run_local_inference(
     };
     if tx
         .send(Ok(wrap_actions(vec![
-            api::client_action::Action::AddMessagesToTask(
-                api::client_action::AddMessagesToTask {
-                    task_id: task_id.clone(),
-                    messages: vec![initial_message],
-                },
-            ),
+            api::client_action::Action::AddMessagesToTask(api::client_action::AddMessagesToTask {
+                task_id: task_id.clone(),
+                messages: vec![initial_message],
+            }),
         ])))
         .await
         .is_err()
@@ -227,31 +196,33 @@ async fn run_local_inference(
         return;
     }
 
-    // 4. Call the LLM and stream chunks.
-    let result = stream_chunks(
+    // Stream the model. Collect any tool calls it emits.
+    let stream_result = stream_and_collect(
         &model_id_str,
-        messages,
+        chat_messages,
         api_keys,
         ollama_url,
         &task_id,
         &response_message_id,
+        &request_id,
         &tx,
         &mut cancellation_rx,
     )
     .await;
 
-    let finish_reason = match result {
+    let finish_reason = match stream_result {
         Ok(()) => api::response_event::stream_finished::Reason::Done(
             api::response_event::stream_finished::Done {},
         ),
         Err(e) => {
-            // Append the error text to the assistant message so the user sees what went wrong.
             let err_text = format!("\n\n[local inference error: {e}]");
             let _ = tx
                 .send(Ok(wrap_actions(vec![
-                    api::client_action::Action::AppendToMessageContent(
-                        append_action(&task_id, &response_message_id, &err_text),
-                    ),
+                    api::client_action::Action::AppendToMessageContent(append_action(
+                        &task_id,
+                        &response_message_id,
+                        &err_text,
+                    )),
                 ])))
                 .await;
             api::response_event::stream_finished::Reason::Other(
@@ -260,7 +231,7 @@ async fn run_local_inference(
         }
     };
 
-    // 5. CommitTransaction
+    // CommitTransaction
     let _ = tx
         .send(Ok(wrap_actions(vec![
             api::client_action::Action::CommitTransaction(
@@ -269,107 +240,256 @@ async fn run_local_inference(
         ])))
         .await;
 
-    // 6. StreamFinished
-    let finished = api::ResponseEvent {
-        r#type: Some(api::response_event::Type::Finished(
-            api::response_event::StreamFinished {
-                reason: Some(finish_reason),
-                conversation_usage_metadata: None,
-                token_usage: vec![],
-                should_refresh_model_config: false,
-                request_cost: None,
-            },
-        )),
-    };
-    let _ = tx.send(Ok(finished)).await;
+    // StreamFinished
+    let _ = tx
+        .send(Ok(api::ResponseEvent {
+            r#type: Some(api::response_event::Type::Finished(
+                api::response_event::StreamFinished {
+                    reason: Some(finish_reason),
+                    conversation_usage_metadata: None,
+                    token_usage: vec![],
+                    should_refresh_model_config: false,
+                    request_cost: None,
+                },
+            )),
+        }))
+        .await;
 }
 
-/// Call the LLM and stream chunks as AppendToMessageContent actions.
 #[allow(clippy::too_many_arguments)]
-async fn stream_chunks(
+async fn stream_and_collect(
     model_id_str: &str,
-    messages: Vec<ChatMsg>,
+    chat_messages: Vec<ChatMsg>,
     api_keys: Option<api::request::settings::ApiKeys>,
     ollama_url: Option<String>,
     task_id: &str,
     message_id: &str,
+    request_id: &str,
     tx: &async_channel::Sender<super::Event>,
     cancellation_rx: &mut futures::channel::oneshot::Receiver<()>,
 ) -> Result<(), anyhow::Error> {
     if let Some(bare_model) = model_id_str.strip_prefix(OLLAMA_ID_PREFIX) {
-        let url = ollama_url
-            .filter(|u| !u.is_empty())
-            .unwrap_or_else(|| ai::ollama_client::DEFAULT_OLLAMA_URL.to_string());
-        let client = OllamaClient::with_base_url(&url);
-        let ollama_messages: Vec<OllamaMessage> = messages
-            .into_iter()
-            .map(|m| OllamaMessage {
-                role: m.role,
-                content: m.content,
-            })
-            .collect();
-        let mut stream = client.chat_streaming(bare_model, ollama_messages).await?;
-        while let Some(chunk) = stream.next().await {
-            if cancellation_rx.try_recv().ok().flatten().is_some() {
-                return Ok(());
-            }
-            match chunk {
-                Ok(ai::ollama_client::StreamChunk::Partial { message, .. }) => {
-                    if !message.content.is_empty() {
-                        tx.send(Ok(wrap_actions(vec![
-                            api::client_action::Action::AppendToMessageContent(append_action(
-                                task_id,
-                                message_id,
-                                &message.content,
-                            )),
-                        ])))
-                        .await
-                        .map_err(|_| anyhow!("receiver dropped"))?;
-                    }
-                }
-                Ok(ai::ollama_client::StreamChunk::Complete { .. }) => break,
-                Err(e) => return Err(anyhow!("ollama stream error: {e}")),
-            }
-        }
-        Ok(())
+        run_ollama(
+            bare_model,
+            chat_messages,
+            ollama_url,
+            task_id,
+            message_id,
+            request_id,
+            tx,
+            cancellation_rx,
+        )
+        .await
     } else if let Some(bare_model) = model_id_str.strip_prefix(OPENROUTER_ID_PREFIX) {
-        let key = api_keys
-            .as_ref()
-            .map(|k| k.open_router.clone())
-            .filter(|k| !k.is_empty())
-            .ok_or_else(|| anyhow!("OpenRouter API key not configured"))?;
-        let client = OpenRouterClient::new(key);
-        let or_messages: Vec<OpenRouterMessage> = messages
-            .into_iter()
-            .map(|m| OpenRouterMessage {
-                role: m.role,
-                content: m.content,
-            })
-            .collect();
-        let stream = client.chat_streaming(bare_model, or_messages).await?;
-        let mut stream = Box::pin(stream);
-        while let Some(chunk) = stream.next().await {
-            if cancellation_rx.try_recv().ok().flatten().is_some() {
-                return Ok(());
-            }
-            match chunk {
-                Ok(content) if !content.is_empty() => {
+        run_openrouter(
+            bare_model,
+            chat_messages,
+            api_keys,
+            task_id,
+            message_id,
+            request_id,
+            tx,
+            cancellation_rx,
+        )
+        .await
+    } else {
+        Err(anyhow!("unknown local model id: {model_id_str}"))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_ollama(
+    bare_model: &str,
+    chat_messages: Vec<ChatMsg>,
+    ollama_url: Option<String>,
+    task_id: &str,
+    message_id: &str,
+    request_id: &str,
+    tx: &async_channel::Sender<super::Event>,
+    cancellation_rx: &mut futures::channel::oneshot::Receiver<()>,
+) -> Result<(), anyhow::Error> {
+    let url = ollama_url
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| ollama::DEFAULT_OLLAMA_URL.to_string());
+    let client = OllamaClient::with_base_url(&url);
+
+    let tool_defs = local_tools::ollama_tool_defs();
+    let messages = chat_messages.into_iter().map(to_ollama_message).collect();
+
+    let stream = client
+        .chat_streaming(bare_model, messages, tool_defs)
+        .await?;
+    let mut stream = Box::pin(stream);
+
+    while let Some(chunk) = stream.next().await {
+        if cancellation_rx.try_recv().ok().flatten().is_some() {
+            return Ok(());
+        }
+        match chunk {
+            Ok(ollama::StreamChunk::Partial { message, .. })
+            | Ok(ollama::StreamChunk::Complete { message, .. }) => {
+                // Text content (if any)
+                if !message.content.is_empty() {
                     tx.send(Ok(wrap_actions(vec![
                         api::client_action::Action::AppendToMessageContent(append_action(
-                            task_id, message_id, &content,
+                            task_id,
+                            message_id,
+                            &message.content,
                         )),
                     ])))
                     .await
                     .map_err(|_| anyhow!("receiver dropped"))?;
                 }
-                Ok(_) => {}
-                Err(e) => return Err(anyhow!("openrouter stream error: {e}")),
+                // Tool calls
+                if !message.tool_calls.is_empty() {
+                    let tool_messages =
+                        tool_calls_to_proto_messages(&message.tool_calls, task_id, request_id);
+                    if !tool_messages.is_empty() {
+                        tx.send(Ok(wrap_actions(vec![
+                            api::client_action::Action::AddMessagesToTask(
+                                api::client_action::AddMessagesToTask {
+                                    task_id: task_id.to_string(),
+                                    messages: tool_messages,
+                                },
+                            ),
+                        ])))
+                        .await
+                        .map_err(|_| anyhow!("receiver dropped"))?;
+                    }
+                }
             }
+            Err(e) => return Err(anyhow!("ollama stream error: {e}")),
         }
-        Ok(())
-    } else {
-        Err(anyhow!("unknown local model id: {model_id_str}"))
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_openrouter(
+    bare_model: &str,
+    chat_messages: Vec<ChatMsg>,
+    api_keys: Option<api::request::settings::ApiKeys>,
+    task_id: &str,
+    message_id: &str,
+    request_id: &str,
+    tx: &async_channel::Sender<super::Event>,
+    cancellation_rx: &mut futures::channel::oneshot::Receiver<()>,
+) -> Result<(), anyhow::Error> {
+    let key = api_keys
+        .as_ref()
+        .map(|k| k.open_router.clone())
+        .filter(|k| !k.is_empty())
+        .ok_or_else(|| anyhow!("OpenRouter API key not configured"))?;
+    let client = OpenRouterClient::new(key);
+
+    let tool_defs = local_tools::openrouter_tool_defs();
+    let messages = chat_messages.into_iter().map(to_openrouter_message).collect();
+
+    let stream = client
+        .chat_streaming(bare_model, messages, tool_defs)
+        .await?;
+    let mut stream = Box::pin(stream);
+    let mut emitted_tool_calls: Vec<OpenRouterToolCall> = Vec::new();
+
+    while let Some(event) = stream.next().await {
+        if cancellation_rx.try_recv().ok().flatten().is_some() {
+            return Ok(());
+        }
+        match event {
+            Ok(OpenRouterStreamEvent::TextDelta(content)) if !content.is_empty() => {
+                tx.send(Ok(wrap_actions(vec![
+                    api::client_action::Action::AppendToMessageContent(append_action(
+                        task_id,
+                        message_id,
+                        &content,
+                    )),
+                ])))
+                .await
+                .map_err(|_| anyhow!("receiver dropped"))?;
+            }
+            Ok(OpenRouterStreamEvent::TextDelta(_)) => {}
+            Ok(OpenRouterStreamEvent::ToolCallComplete(tc)) => {
+                emitted_tool_calls.push(tc);
+            }
+            Err(e) => return Err(anyhow!("openrouter stream error: {e}")),
+        }
+    }
+
+    // Batch-emit tool calls at end of stream (they were accumulated incrementally).
+    if !emitted_tool_calls.is_empty() {
+        let tool_messages =
+            openrouter_tool_calls_to_proto_messages(&emitted_tool_calls, task_id, request_id);
+        if !tool_messages.is_empty() {
+            tx.send(Ok(wrap_actions(vec![
+                api::client_action::Action::AddMessagesToTask(
+                    api::client_action::AddMessagesToTask {
+                        task_id: task_id.to_string(),
+                        messages: tool_messages,
+                    },
+                ),
+            ])))
+            .await
+            .map_err(|_| anyhow!("receiver dropped"))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn tool_calls_to_proto_messages(
+    tool_calls: &[OllamaToolCall],
+    task_id: &str,
+    request_id: &str,
+) -> Vec<api::Message> {
+    tool_calls
+        .iter()
+        .filter_map(|tc| {
+            // Ollama sends arguments as a JSON value (object). Stringify it.
+            let args_str = serde_json::to_string(&tc.function.arguments).ok()?;
+            let tool_call_id = format!("call-{}", Uuid::new_v4());
+            let proto_tc = local_tools::into_proto_tool_call(
+                tool_call_id.clone(),
+                &tc.function.name,
+                &args_str,
+            )?;
+            Some(api::Message {
+                id: Uuid::new_v4().to_string(),
+                task_id: task_id.to_string(),
+                request_id: request_id.to_string(),
+                timestamp: Some(current_proto_timestamp()),
+                server_message_data: String::new(),
+                citations: vec![],
+                message: Some(api::message::Message::ToolCall(proto_tc)),
+            })
+        })
+        .collect()
+}
+
+fn openrouter_tool_calls_to_proto_messages(
+    tool_calls: &[OpenRouterToolCall],
+    task_id: &str,
+    request_id: &str,
+) -> Vec<api::Message> {
+    tool_calls
+        .iter()
+        .filter_map(|tc| {
+            // OpenRouter/OpenAI: arguments is already a JSON string.
+            let proto_tc = local_tools::into_proto_tool_call(
+                tc.id.clone(),
+                &tc.function.name,
+                &tc.function.arguments,
+            )?;
+            Some(api::Message {
+                id: Uuid::new_v4().to_string(),
+                task_id: task_id.to_string(),
+                request_id: request_id.to_string(),
+                timestamp: Some(current_proto_timestamp()),
+                server_message_data: String::new(),
+                citations: vec![],
+                message: Some(api::message::Message::ToolCall(proto_tc)),
+            })
+        })
+        .collect()
 }
 
 fn wrap_actions(actions: Vec<api::client_action::Action>) -> api::ResponseEvent {
@@ -390,7 +510,6 @@ fn append_action(
     message_id: &str,
     chunk: &str,
 ) -> api::client_action::AppendToMessageContent {
-    // We target the agent_output.text field for simple text appends.
     use prost_types::FieldMask;
     let message = api::Message {
         id: message_id.to_string(),
@@ -414,95 +533,220 @@ fn append_action(
     }
 }
 
-/// Minimal system prompt for local models. Keeps things neutral — we're not the
-/// full Warp agent, but we mention the context.
 fn build_system_prompt() -> String {
-    r#"You are a helpful AI assistant running inside the Warp terminal.
-The user is in a command-line environment. Keep answers concise and practical.
-You do not currently have access to tool-calling (shell commands, file access).
-Just respond with plain text."#
-        .to_string()
+    r#"You are a helpful AI coding assistant running inside the Warp terminal.
+You can use the provided tools (run_shell_command, read_files, grep, file_glob)
+to inspect the user's project, run commands, and carry out tasks on their
+behalf. Prefer issuing tool calls over describing what you would do — the user
+wants actions, not explanations.
+
+Tool call guidelines:
+- Set is_read_only=true on run_shell_command for safe, non-mutating commands.
+- Be concise. Don't repeat tool output back verbatim in your reply.
+- When you have enough information to answer, respond with plain text and no
+  tool calls.
+"#
+    .to_string()
+}
+
+/// Intermediate chat-message representation used before translating to
+/// provider-specific types.
+#[derive(Clone, Debug)]
+enum ChatMsg {
+    System(String),
+    User(String),
+    Assistant {
+        text: String,
+        tool_calls: Vec<ProtoToolCallRef>,
+    },
+    ToolResult {
+        tool_call_id: String,
+        tool_name: String,
+        content: String,
+    },
 }
 
 #[derive(Clone, Debug)]
-struct ChatMsg {
-    role: String,
-    content: String,
+struct ProtoToolCallRef {
+    id: String,
+    name: String,
+    arguments_json: String,
 }
 
-/// Walk existing tasks → messages to build conversation history, then append
-/// the latest user input as the final user turn.
-fn build_chat_messages(
-    system_prompt: &str,
-    tasks: &[api::Task],
-    input: &[AIAgentInput],
-) -> Vec<ChatMsg> {
-    let mut messages = vec![ChatMsg {
-        role: "system".to_string(),
-        content: system_prompt.to_string(),
-    }];
+fn to_ollama_message(m: ChatMsg) -> OllamaMessage {
+    match m {
+        ChatMsg::System(c) => OllamaMessage {
+            role: "system".to_string(),
+            content: c,
+            ..Default::default()
+        },
+        ChatMsg::User(c) => OllamaMessage {
+            role: "user".to_string(),
+            content: c,
+            ..Default::default()
+        },
+        ChatMsg::Assistant { text, tool_calls } => OllamaMessage {
+            role: "assistant".to_string(),
+            content: text,
+            tool_calls: tool_calls
+                .into_iter()
+                .map(|tc| OllamaToolCall {
+                    function: OllamaFunctionCall {
+                        name: tc.name,
+                        arguments: serde_json::from_str(&tc.arguments_json)
+                            .unwrap_or(serde_json::Value::Null),
+                    },
+                })
+                .collect(),
+            ..Default::default()
+        },
+        ChatMsg::ToolResult {
+            tool_call_id: _,
+            tool_name,
+            content,
+        } => OllamaMessage {
+            role: "tool".to_string(),
+            content,
+            tool_name: Some(tool_name),
+            ..Default::default()
+        },
+    }
+}
 
-    // Include conversation history from existing tasks.
-    for task in tasks {
-        for m in &task.messages {
-            if let Some(inner) = &m.message {
-                match inner {
-                    api::message::Message::UserQuery(q) => {
-                        if !q.query.is_empty() {
-                            messages.push(ChatMsg {
-                                role: "user".to_string(),
-                                content: q.query.clone(),
-                            });
-                        }
-                    }
-                    api::message::Message::AgentOutput(a) => {
-                        if !a.text.is_empty() {
-                            messages.push(ChatMsg {
-                                role: "assistant".to_string(),
-                                content: a.text.clone(),
-                            });
-                        }
-                    }
-                    _ => {}
+fn to_openrouter_message(m: ChatMsg) -> OpenRouterMessage {
+    match m {
+        ChatMsg::System(c) => OpenRouterMessage::system(c),
+        ChatMsg::User(c) => OpenRouterMessage::user(c),
+        ChatMsg::Assistant { text, tool_calls } => {
+            if tool_calls.is_empty() {
+                OpenRouterMessage::assistant_text(text)
+            } else {
+                OpenRouterMessage::assistant_tool_calls(
+                    tool_calls
+                        .into_iter()
+                        .map(|tc| OpenRouterToolCall {
+                            id: tc.id,
+                            call_type: "function".to_string(),
+                            function: OpenRouterFunctionCall {
+                                name: tc.name,
+                                arguments: tc.arguments_json,
+                            },
+                        })
+                        .collect(),
+                )
+            }
+        }
+        ChatMsg::ToolResult {
+            tool_call_id,
+            tool_name,
+            content,
+        } => OpenRouterMessage::tool_result(tool_call_id, tool_name, content),
+    }
+}
+
+/// Build the chat message history for the model. Pulls:
+/// 1. Prior task messages (user queries, agent outputs, tool calls, tool results)
+///    from params.tasks — this reconstructs the conversation.
+/// 2. The current turn's input (user query OR tool-call-result entries).
+fn build_chat_messages(params: &RequestParams) -> Vec<ChatMsg> {
+    let mut out = vec![ChatMsg::System(build_system_prompt())];
+
+    // Replay prior conversation.
+    for task in &params.tasks {
+        for msg in &task.messages {
+            let Some(inner) = &msg.message else { continue };
+            match inner {
+                api::message::Message::UserQuery(q) if !q.query.is_empty() => {
+                    out.push(ChatMsg::User(q.query.clone()));
                 }
+                api::message::Message::AgentOutput(a) if !a.text.is_empty() => {
+                    // Emit as assistant text WITHOUT tool calls. If the next
+                    // message is a tool_call, it will be merged in below.
+                    out.push(ChatMsg::Assistant {
+                        text: a.text.clone(),
+                        tool_calls: vec![],
+                    });
+                }
+                api::message::Message::ToolCall(tc) => {
+                    // Encode as an assistant message with a single tool call.
+                    let (name, args) = proto_tool_call_to_name_args(tc);
+                    out.push(ChatMsg::Assistant {
+                        text: String::new(),
+                        tool_calls: vec![ProtoToolCallRef {
+                            id: tc.tool_call_id.clone(),
+                            name,
+                            arguments_json: args,
+                        }],
+                    });
+                }
+                api::message::Message::ToolCallResult(tcr) => {
+                    out.push(ChatMsg::ToolResult {
+                        tool_call_id: tcr.tool_call_id.clone(),
+                        tool_name: String::new(),
+                        content: stringify_tool_call_result(tcr),
+                    });
+                }
+                _ => {}
             }
         }
     }
 
-    // Append the current user input.
-    let current_user_text = extract_user_text(input);
-    if !current_user_text.is_empty() {
-        messages.push(ChatMsg {
-            role: "user".to_string(),
-            content: current_user_text,
-        });
-    }
-
-    messages
-}
-
-fn extract_user_text(input: &[AIAgentInput]) -> String {
-    for ai in input {
-        match ai {
-            AIAgentInput::UserQuery { query, .. } => {
-                if !query.is_empty() {
-                    return query.clone();
-                }
+    // Current turn's input.
+    for input in &params.input {
+        match input {
+            AIAgentInput::UserQuery { query, .. } if !query.is_empty() => {
+                out.push(ChatMsg::User(query.clone()));
             }
-            AIAgentInput::AutoCodeDiffQuery { query, .. } => {
-                if !query.is_empty() {
-                    return query.clone();
-                }
+            AIAgentInput::ActionResult { result, .. } => {
+                out.push(ChatMsg::ToolResult {
+                    tool_call_id: format!("{:?}", result.id),
+                    tool_name: String::new(),
+                    content: format!("{}", result.result),
+                });
             }
-            AIAgentInput::CreateNewProject { query, .. } => {
-                if !query.is_empty() {
-                    return query.clone();
-                }
+            AIAgentInput::ResumeConversation { .. } => {
+                // Nothing new to add; prior context carries the state.
             }
             _ => {}
         }
     }
-    String::new()
+
+    out
+}
+
+/// Best-effort extraction of (function_name, arguments_json_string) from a
+/// proto ToolCall, matching the OpenAI/Ollama function calling shape.
+fn proto_tool_call_to_name_args(tc: &api::message::ToolCall) -> (String, String) {
+    match &tc.tool {
+        Some(api::message::tool_call::Tool::RunShellCommand(c)) => {
+            let args = serde_json::json!({"command": c.command, "is_read_only": c.is_read_only});
+            ("run_shell_command".into(), args.to_string())
+        }
+        Some(api::message::tool_call::Tool::ReadFiles(r)) => {
+            let paths: Vec<String> = r.files.iter().map(|f| f.name.clone()).collect();
+            let args = serde_json::json!({"paths": paths});
+            ("read_files".into(), args.to_string())
+        }
+        Some(api::message::tool_call::Tool::Grep(g)) => {
+            let args = serde_json::json!({"queries": g.queries, "path": g.path});
+            ("grep".into(), args.to_string())
+        }
+        Some(api::message::tool_call::Tool::FileGlobV2(g)) => {
+            let args =
+                serde_json::json!({"patterns": g.patterns, "search_dir": g.search_dir});
+            ("file_glob".into(), args.to_string())
+        }
+        _ => (
+            "<unknown_tool>".into(),
+            local_tools::tool_call_summary(tc),
+        ),
+    }
+}
+
+fn stringify_tool_call_result(tcr: &api::message::ToolCallResult) -> String {
+    // The proto type isn't Serialize; use Debug formatting which is enough for
+    // the model to see the structure and key fields.
+    format!("{tcr:?}")
 }
 
 fn current_proto_timestamp() -> prost_types::Timestamp {
@@ -515,5 +759,3 @@ fn current_proto_timestamp() -> prost_types::Timestamp {
         nanos: duration.subsec_nanos() as i32,
     }
 }
-
-// End of file.

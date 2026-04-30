@@ -3,6 +3,7 @@ mod convert_from;
 mod convert_to;
 mod r#impl;
 pub mod local_inference;
+pub mod local_tools;
 
 pub use ai::agent::convert::ConvertToAPITypeError;
 use ai::api_keys::ApiKeyManager;

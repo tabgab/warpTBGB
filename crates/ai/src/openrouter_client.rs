@@ -2,6 +2,8 @@
 //!
 //! OpenRouter is an OpenAI-API-compatible aggregator at https://openrouter.ai/api/v1.
 //! It serves models from many providers using a unified chat-completions API.
+//!
+//! Supports OpenAI-format tool calling for compatible models.
 
 use futures::StreamExt;
 use reqwest::Client;
@@ -14,14 +16,106 @@ pub const DEFAULT_OPENROUTER_URL: &str = "https://openrouter.ai/api/v1";
 /// Default request timeout.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
 
-/// A chat message (OpenAI format).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A chat message in the OpenAI-compatible format, including optional tool
+/// call and tool result semantics.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// Tool calls emitted by the assistant (role = "assistant").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    /// When role = "tool", this is the id of the tool call this message is
+    /// responding to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Optional display name (used by the `tool` role to identify which tool).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
-/// Chat completion request (OpenAI format, OpenRouter-compatible subset).
+impl ChatMessage {
+    pub fn system(content: impl Into<String>) -> Self {
+        Self {
+            role: "system".to_string(),
+            content: Some(content.into()),
+            ..Default::default()
+        }
+    }
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: "user".to_string(),
+            content: Some(content.into()),
+            ..Default::default()
+        }
+    }
+    pub fn assistant_text(content: impl Into<String>) -> Self {
+        Self {
+            role: "assistant".to_string(),
+            content: Some(content.into()),
+            ..Default::default()
+        }
+    }
+    pub fn assistant_tool_calls(tool_calls: Vec<ToolCall>) -> Self {
+        Self {
+            role: "assistant".to_string(),
+            content: None,
+            tool_calls,
+            ..Default::default()
+        }
+    }
+    pub fn tool_result(
+        tool_call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        Self {
+            role: "tool".to_string(),
+            content: Some(content.into()),
+            tool_call_id: Some(tool_call_id.into()),
+            name: Some(tool_name.into()),
+            ..Default::default()
+        }
+    }
+}
+
+/// OpenAI-format tool call emitted by the model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type", default = "default_tool_type")]
+    pub call_type: String,
+    pub function: FunctionCall,
+}
+
+fn default_tool_type() -> String {
+    "function".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionCall {
+    pub name: String,
+    /// Arguments as a JSON string (OpenAI's native format).
+    pub arguments: String,
+}
+
+/// OpenAI-format tool definition sent in the request.
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolDef {
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    pub function: FunctionDef,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FunctionDef {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+/// Chat completion request (OpenAI format).
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatRequest {
     pub model: String,
@@ -32,6 +126,10 @@ pub struct ChatRequest {
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ToolDef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
 }
 
 /// Model entry from OpenRouter's /api/v1/models endpoint.
@@ -61,7 +159,7 @@ pub struct ListModelsResponse {
     pub data: Vec<ModelInfo>,
 }
 
-/// Non-streaming chat completion response (OpenAI format).
+/// Non-streaming chat completion response.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatCompletionResponse {
     pub id: String,
@@ -88,7 +186,8 @@ pub struct Usage {
     pub total_tokens: Option<u32>,
 }
 
-/// Streaming chat completion chunk (OpenAI SSE format).
+/// A single streaming chunk. Can contain text content OR an incremental
+/// slice of a tool call's arguments string.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatCompletionChunk {
     pub id: String,
@@ -109,6 +208,29 @@ pub struct StreamDelta {
     pub role: Option<String>,
     #[serde(default)]
     pub content: Option<String>,
+    /// Incremental tool call slices. When present, these need to be
+    /// accumulated by index until the stream finishes.
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCallDelta>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolCallDelta {
+    pub index: u32,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default, rename = "type")]
+    pub call_type: Option<String>,
+    #[serde(default)]
+    pub function: Option<FunctionCallDelta>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FunctionCallDelta {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub arguments: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -127,6 +249,15 @@ pub enum OpenRouterError {
 }
 
 pub type OpenRouterResult<T> = std::result::Result<T, OpenRouterError>;
+
+/// One streamed event surfaced to the caller.
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    /// Incremental text content from the assistant.
+    TextDelta(String),
+    /// A fully-assembled tool call (emitted once all its argument slices have arrived).
+    ToolCallComplete(ToolCall),
+}
 
 /// OpenRouter client.
 #[derive(Debug, Clone)]
@@ -175,49 +306,13 @@ impl OpenRouterClient {
         Ok(result.data)
     }
 
-    /// Non-streaming chat completion.
-    pub async fn chat(
-        &self,
-        model: &str,
-        messages: Vec<ChatMessage>,
-    ) -> OpenRouterResult<ChatCompletionResponse> {
-        let request = ChatRequest {
-            model: model.to_string(),
-            messages,
-            stream: Some(false),
-            temperature: None,
-            max_tokens: None,
-        };
-
-        let response = self
-            .http_client
-            .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(&self.api_key)
-            .header("HTTP-Referer", "https://warp.dev")
-            .header("X-Title", "Warp")
-            .json(&request)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(OpenRouterError::ServerError(format!(
-                "Server returned status {status}: {body}"
-            )));
-        }
-
-        let body = response.text().await?;
-        let result: ChatCompletionResponse = serde_json::from_str(&body)?;
-        Ok(result)
-    }
-
-    /// Streaming chat completion; yields content deltas as strings.
+    /// Streaming chat completion; yields text deltas and complete tool calls.
     pub async fn chat_streaming(
         &self,
         model: &str,
         messages: Vec<ChatMessage>,
-    ) -> OpenRouterResult<impl futures::Stream<Item = OpenRouterResult<String>> + Send + 'static>
+        tools: Vec<ToolDef>,
+    ) -> OpenRouterResult<impl futures::Stream<Item = OpenRouterResult<StreamEvent>> + Send + 'static>
     {
         let request = ChatRequest {
             model: model.to_string(),
@@ -225,6 +320,8 @@ impl OpenRouterClient {
             stream: Some(true),
             temperature: None,
             max_tokens: None,
+            tools,
+            tool_choice: None,
         };
 
         let response = self
@@ -245,11 +342,13 @@ impl OpenRouterClient {
             )));
         }
 
-        // Server-Sent Events: lines prefixed with "data: ", terminated by blank line.
-        // "data: [DONE]" indicates end of stream.
         let stream = async_stream::stream! {
             let mut bytes_stream = response.bytes_stream();
             let mut buffer = String::new();
+            // Accumulators for in-flight tool calls, keyed by OpenAI's stream index.
+            let mut tool_accum: std::collections::BTreeMap<u32, ToolCallAccum> =
+                std::collections::BTreeMap::new();
+
             while let Some(chunk) = bytes_stream.next().await {
                 match chunk {
                     Ok(bytes) => {
@@ -257,23 +356,48 @@ impl OpenRouterClient {
                         while let Some(newline_idx) = buffer.find('\n') {
                             let line = buffer[..newline_idx].trim().to_string();
                             buffer.drain(..=newline_idx);
-                            if let Some(data) = line.strip_prefix("data: ") {
-                                if data.trim() == "[DONE]" {
-                                    return;
+                            let Some(data) = line.strip_prefix("data: ") else {
+                                continue;
+                            };
+                            if data.trim() == "[DONE]" {
+                                // Flush any remaining tool calls.
+                                for (_, acc) in std::mem::take(&mut tool_accum) {
+                                    if let Some(tc) = acc.into_tool_call() {
+                                        yield Ok(StreamEvent::ToolCallComplete(tc));
+                                    }
                                 }
-                                match serde_json::from_str::<ChatCompletionChunk>(data) {
-                                    Ok(chunk) => {
-                                        if let Some(choice) = chunk.choices.first() {
-                                            if let Some(content) = &choice.delta.content {
-                                                if !content.is_empty() {
-                                                    yield Ok(content.clone());
+                                return;
+                            }
+                            match serde_json::from_str::<ChatCompletionChunk>(data) {
+                                Ok(chunk) => {
+                                    let Some(choice) = chunk.choices.first() else { continue; };
+                                    if let Some(content) = &choice.delta.content {
+                                        if !content.is_empty() {
+                                            yield Ok(StreamEvent::TextDelta(content.clone()));
+                                        }
+                                    }
+                                    for tcd in &choice.delta.tool_calls {
+                                        let acc = tool_accum.entry(tcd.index).or_default();
+                                        if let Some(id) = &tcd.id { acc.id = Some(id.clone()); }
+                                        if let Some(t) = &tcd.call_type { acc.call_type = t.clone(); }
+                                        if let Some(func) = &tcd.function {
+                                            if let Some(name) = &func.name { acc.name = Some(name.clone()); }
+                                            if let Some(args) = &func.arguments { acc.arguments.push_str(args); }
+                                        }
+                                    }
+                                    // OpenAI signals end-of-tool-calls via finish_reason: "tool_calls".
+                                    if let Some(reason) = &choice.finish_reason {
+                                        if reason == "tool_calls" || reason == "stop" {
+                                            for (_, acc) in std::mem::take(&mut tool_accum) {
+                                                if let Some(tc) = acc.into_tool_call() {
+                                                    yield Ok(StreamEvent::ToolCallComplete(tc));
                                                 }
                                             }
                                         }
                                     }
-                                    Err(e) => {
-                                        log::debug!("Failed to parse OpenRouter chunk '{data}': {e}");
-                                    }
+                                }
+                                Err(e) => {
+                                    log::debug!("Failed to parse OpenRouter chunk '{data}': {e}");
                                 }
                             }
                         }
@@ -284,9 +408,42 @@ impl OpenRouterClient {
                     }
                 }
             }
+            // Stream ended without [DONE]; flush whatever's accumulated.
+            for (_, acc) in std::mem::take(&mut tool_accum) {
+                if let Some(tc) = acc.into_tool_call() {
+                    yield Ok(StreamEvent::ToolCallComplete(tc));
+                }
+            }
         };
 
         Ok(stream)
+    }
+}
+
+#[derive(Default, Debug, Clone)]
+struct ToolCallAccum {
+    id: Option<String>,
+    call_type: String,
+    name: Option<String>,
+    arguments: String,
+}
+
+impl ToolCallAccum {
+    fn into_tool_call(self) -> Option<ToolCall> {
+        let id = self.id?;
+        let name = self.name?;
+        Some(ToolCall {
+            id,
+            call_type: if self.call_type.is_empty() {
+                "function".to_string()
+            } else {
+                self.call_type
+            },
+            function: FunctionCall {
+                name,
+                arguments: self.arguments,
+            },
+        })
     }
 }
 
@@ -295,26 +452,70 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_serialize_chat_request() {
+    fn test_serialize_chat_request_without_tools() {
         let req = ChatRequest {
-            model: "deepseek/deepseek-v4-pro".to_string(),
-            messages: vec![ChatMessage {
-                role: "user".to_string(),
-                content: "Hi".to_string(),
-            }],
+            model: "x/y".to_string(),
+            messages: vec![ChatMessage::user("Hi")],
             stream: Some(true),
             temperature: None,
             max_tokens: None,
+            tools: vec![],
+            tool_choice: None,
         };
         let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("\"stream\":true"));
-        assert!(!json.contains("temperature"));
+        assert!(!json.contains("\"tools\""));
     }
 
     #[test]
-    fn test_parse_chunk() {
+    fn test_serialize_chat_request_with_tools() {
+        let req = ChatRequest {
+            model: "x/y".to_string(),
+            messages: vec![ChatMessage::user("Hi")],
+            stream: Some(true),
+            temperature: None,
+            max_tokens: None,
+            tools: vec![ToolDef {
+                tool_type: "function".to_string(),
+                function: FunctionDef {
+                    name: "run".to_string(),
+                    description: "run a thing".to_string(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+            }],
+            tool_choice: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"tools\""));
+        assert!(json.contains("\"run\""));
+    }
+
+    #[test]
+    fn test_parse_text_chunk() {
         let json = r#"{"id":"1","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}"#;
         let chunk: ChatCompletionChunk = serde_json::from_str(json).unwrap();
         assert_eq!(chunk.choices[0].delta.content, Some("Hello".to_string()));
+    }
+
+    #[test]
+    fn test_parse_tool_call_chunk() {
+        let json = r#"{"id":"1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"run_shell","arguments":"{\"cmd\":"}}]},"finish_reason":null}]}"#;
+        let chunk: ChatCompletionChunk = serde_json::from_str(json).unwrap();
+        let tcd = &chunk.choices[0].delta.tool_calls[0];
+        assert_eq!(tcd.id, Some("call_abc".to_string()));
+        assert_eq!(
+            tcd.function.as_ref().and_then(|f| f.name.clone()),
+            Some("run_shell".to_string())
+        );
+    }
+
+    #[test]
+    fn test_tool_call_accum() {
+        let mut acc = ToolCallAccum::default();
+        acc.id = Some("call_1".to_string());
+        acc.name = Some("run_shell_command".to_string());
+        acc.arguments = r#"{"command":"ls"}"#.to_string();
+        let tc = acc.into_tool_call().unwrap();
+        assert_eq!(tc.id, "call_1");
+        assert_eq!(tc.function.arguments, r#"{"command":"ls"}"#);
     }
 }

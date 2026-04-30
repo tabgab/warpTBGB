@@ -19,10 +19,47 @@ pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// A message in an Ollama chat conversation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Ollama (v0.3+) supports OpenAI-compatible tool calling:
+/// - assistant messages can carry `tool_calls`
+/// - tool-result messages use role = "tool"
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChatMessage {
     pub role: String,
+    #[serde(default)]
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+}
+
+/// Tool call emitted by an Ollama assistant response.
+/// Ollama encodes `arguments` as a JSON object (not a string like OpenAI).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub function: FunctionCall,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionCall {
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
+/// Tool definition to send in the request.
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolDef {
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    pub function: FunctionDef,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FunctionDef {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
 }
 
 /// Request payload for Ollama chat API.
@@ -32,6 +69,8 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ToolDef>,
 }
 
 /// Response from Ollama chat API (non-streaming).
@@ -241,6 +280,7 @@ impl OllamaClient {
             model: model.to_string(),
             messages,
             stream: Some(false),
+            tools: vec![],
         };
 
         let response = self
@@ -269,11 +309,19 @@ impl OllamaClient {
         &self,
         model: &str,
         messages: Vec<ChatMessage>,
+        tools: Vec<ToolDef>,
     ) -> OllamaResult<impl futures::Stream<Item = OllamaResult<StreamChunk>>> {
+        // NOTE: Ollama currently streams text chunks but waits until the full
+        // response is ready before emitting tool_calls (they appear as a
+        // single non-streaming chunk with the final message). If tools are
+        // present we disable streaming so we get a single clean response that
+        // definitely includes tool_calls.
+        let use_stream = tools.is_empty();
         let request = ChatRequest {
             model: model.to_string(),
             messages,
-            stream: Some(true),
+            stream: Some(use_stream),
+            tools,
         };
 
         let response = self
@@ -328,10 +376,7 @@ impl OllamaClient {
                     // If no valid chunk found, skip
                     Ok(StreamChunk::Partial {
                         model: String::new(),
-                        message: ChatMessage {
-                            role: String::new(),
-                            content: String::new(),
-                        },
+                        message: ChatMessage::default(),
                         done: false,
                     })
                 })
@@ -345,6 +390,7 @@ impl OllamaClient {
         ChatMessage {
             role: role.into(),
             content: content.into(),
+            ..Default::default()
         }
     }
 }
@@ -399,10 +445,12 @@ mod tests {
             model: "llama3".to_string(),
             messages: vec![ChatMessage::user("Hi")],
             stream: Some(true),
+            tools: vec![],
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("\"model\":\"llama3\""));
         assert!(json.contains("\"stream\":true"));
+        assert!(!json.contains("\"tools\""));
     }
 
     #[tokio::test]
