@@ -651,7 +651,11 @@ fn to_openrouter_message(m: ChatMsg) -> OpenRouterMessage {
 fn build_chat_messages(params: &RequestParams) -> Vec<ChatMsg> {
     let mut out = vec![ChatMsg::System(build_system_prompt())];
 
-    // Replay prior conversation.
+    // Replay prior conversation. We coalesce consecutive assistant messages
+    // (text + tool_calls) into a single ChatMsg::Assistant so the provider
+    // sees a valid OpenAI-format sequence:
+    //   user -> assistant{text, tool_calls: [...]} -> tool(r1) -> tool(r2) -> ...
+    // without extra empty assistant messages in between.
     for task in &params.tasks {
         for msg in &task.messages {
             let Some(inner) = &msg.message else { continue };
@@ -660,24 +664,41 @@ fn build_chat_messages(params: &RequestParams) -> Vec<ChatMsg> {
                     out.push(ChatMsg::User(q.query.clone()));
                 }
                 api::message::Message::AgentOutput(a) if !a.text.is_empty() => {
-                    // Emit as assistant text WITHOUT tool calls. If the next
-                    // message is a tool_call, it will be merged in below.
-                    out.push(ChatMsg::Assistant {
-                        text: a.text.clone(),
-                        tool_calls: vec![],
-                    });
+                    // Merge into preceding assistant message if it exists and
+                    // has no tool_calls yet; otherwise start a new one.
+                    match out.last_mut() {
+                        Some(ChatMsg::Assistant { text, tool_calls })
+                            if tool_calls.is_empty() =>
+                        {
+                            if !text.is_empty() {
+                                text.push('\n');
+                            }
+                            text.push_str(&a.text);
+                        }
+                        _ => out.push(ChatMsg::Assistant {
+                            text: a.text.clone(),
+                            tool_calls: vec![],
+                        }),
+                    }
                 }
                 api::message::Message::ToolCall(tc) => {
-                    // Encode as an assistant message with a single tool call.
                     let (name, args) = proto_tool_call_to_name_args(tc);
-                    out.push(ChatMsg::Assistant {
-                        text: String::new(),
-                        tool_calls: vec![ProtoToolCallRef {
-                            id: tc.tool_call_id.clone(),
-                            name,
-                            arguments_json: args,
-                        }],
-                    });
+                    let call_ref = ProtoToolCallRef {
+                        id: tc.tool_call_id.clone(),
+                        name,
+                        arguments_json: args,
+                    };
+                    // Merge into the preceding assistant message so text + all
+                    // tool_calls emitted in the same turn form ONE message.
+                    match out.last_mut() {
+                        Some(ChatMsg::Assistant { tool_calls, .. }) => {
+                            tool_calls.push(call_ref);
+                        }
+                        _ => out.push(ChatMsg::Assistant {
+                            text: String::new(),
+                            tool_calls: vec![call_ref],
+                        }),
+                    }
                 }
                 api::message::Message::ToolCallResult(tcr) => {
                     out.push(ChatMsg::ToolResult {
@@ -699,7 +720,7 @@ fn build_chat_messages(params: &RequestParams) -> Vec<ChatMsg> {
             }
             AIAgentInput::ActionResult { result, .. } => {
                 out.push(ChatMsg::ToolResult {
-                    tool_call_id: format!("{:?}", result.id),
+                    tool_call_id: result.id.to_string(),
                     tool_name: String::new(),
                     content: format!("{}", result.result),
                 });
