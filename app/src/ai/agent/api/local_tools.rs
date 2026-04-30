@@ -122,6 +122,52 @@ fn tool_schemas() -> Vec<(String, String, Value)> {
                 "required": ["patterns"]
             }),
         ),
+        (
+            "apply_file_diffs".to_string(),
+            "Create new files, edit existing files, or delete files. Use this whenever you want \
+             to write code or modify the project. The user may be prompted to approve each \
+             change before it's applied."
+                .to_string(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": "One-line summary describing what this set of edits accomplishes."
+                    },
+                    "new_files": {
+                        "type": "array",
+                        "description": "Files to create. Each must have a path and full content.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "file_path": {"type": "string", "description": "Path of the file to create (absolute or working-directory-relative)."},
+                                "content": {"type": "string", "description": "Full file contents."}
+                            },
+                            "required": ["file_path", "content"]
+                        }
+                    },
+                    "edits": {
+                        "type": "array",
+                        "description": "Edits to existing files using search/replace semantics. The `search` string must match the file contents exactly (including whitespace) and must be unique in the file.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "file_path": {"type": "string"},
+                                "search": {"type": "string", "description": "Exact text to replace."},
+                                "replace": {"type": "string", "description": "Replacement text."}
+                            },
+                            "required": ["file_path", "search", "replace"]
+                        }
+                    },
+                    "deleted_files": {
+                        "type": "array",
+                        "description": "File paths to delete.",
+                        "items": {"type": "string"}
+                    }
+                }
+            }),
+        ),
     ]
 }
 
@@ -212,6 +258,75 @@ pub fn into_proto_tool_call(
                 },
             ))
         }
+        "apply_file_diffs" => {
+            let summary = args
+                .get("summary")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let new_files: Vec<api::message::tool_call::apply_file_diffs::NewFile> = args
+                .get("new_files")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|v| {
+                            let file_path = v.get("file_path")?.as_str()?.to_string();
+                            let content = v.get("content")?.as_str()?.to_string();
+                            Some(api::message::tool_call::apply_file_diffs::NewFile {
+                                file_path,
+                                content,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let diffs: Vec<api::message::tool_call::apply_file_diffs::FileDiff> = args
+                .get("edits")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|v| {
+                            let file_path = v.get("file_path")?.as_str()?.to_string();
+                            let search = v.get("search")?.as_str()?.to_string();
+                            let replace = v.get("replace")?.as_str()?.to_string();
+                            Some(api::message::tool_call::apply_file_diffs::FileDiff {
+                                file_path,
+                                search,
+                                replace,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let deleted_files: Vec<api::message::tool_call::apply_file_diffs::DeleteFile> = args
+                .get("deleted_files")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .map(|file_path| {
+                            api::message::tool_call::apply_file_diffs::DeleteFile { file_path }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            // All three lists empty -> nothing to do; reject so model retries.
+            if new_files.is_empty() && diffs.is_empty() && deleted_files.is_empty() {
+                return None;
+            }
+            Some(api::message::tool_call::Tool::ApplyFileDiffs(
+                api::message::tool_call::ApplyFileDiffs {
+                    summary,
+                    new_files,
+                    diffs,
+                    v4a_updates: vec![],
+                    deleted_files,
+                },
+            ))
+        }
         _ => None,
     };
 
@@ -238,6 +353,15 @@ pub fn tool_call_summary(tc: &api::message::ToolCall) -> String {
         }
         Some(api::message::tool_call::Tool::FileGlobV2(g)) => {
             format!("file_glob {:?} in {}", g.patterns, g.search_dir)
+        }
+        Some(api::message::tool_call::Tool::ApplyFileDiffs(a)) => {
+            format!(
+                "apply_file_diffs: {} new / {} edits / {} deleted — {}",
+                a.new_files.len(),
+                a.diffs.len(),
+                a.deleted_files.len(),
+                a.summary
+            )
         }
         _ => "<tool call>".to_string(),
     }

@@ -757,6 +757,35 @@ fn proto_tool_call_to_name_args(tc: &api::message::ToolCall) -> (String, String)
                 serde_json::json!({"patterns": g.patterns, "search_dir": g.search_dir});
             ("file_glob".into(), args.to_string())
         }
+        Some(api::message::tool_call::Tool::ApplyFileDiffs(a)) => {
+            let new_files: Vec<serde_json::Value> = a
+                .new_files
+                .iter()
+                .map(|nf| {
+                    serde_json::json!({"file_path": nf.file_path, "content": nf.content})
+                })
+                .collect();
+            let edits: Vec<serde_json::Value> = a
+                .diffs
+                .iter()
+                .map(|d| {
+                    serde_json::json!({
+                        "file_path": d.file_path,
+                        "search": d.search,
+                        "replace": d.replace,
+                    })
+                })
+                .collect();
+            let deleted_files: Vec<&str> =
+                a.deleted_files.iter().map(|d| d.file_path.as_str()).collect();
+            let args = serde_json::json!({
+                "summary": a.summary,
+                "new_files": new_files,
+                "edits": edits,
+                "deleted_files": deleted_files,
+            });
+            ("apply_file_diffs".into(), args.to_string())
+        }
         _ => (
             "<unknown_tool>".into(),
             local_tools::tool_call_summary(tc),
