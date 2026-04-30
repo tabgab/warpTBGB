@@ -159,6 +159,51 @@ impl From<StreamChunkHelper> for StreamChunk {
     }
 }
 
+/// Debug-log a stream chunk. Gated on `log::log_enabled!(Debug)` so the
+/// overhead is zero when debug logging is disabled.
+fn log_chunk(chunk: &StreamChunk) {
+    if !log::log_enabled!(log::Level::Debug) {
+        return;
+    }
+    match chunk {
+        StreamChunk::Partial { message, done, .. } => {
+            let preview: String = message.content.chars().take(120).collect();
+            log::debug!(
+                "ollama chunk partial: done={} content_len={} tool_calls={} preview={:?}",
+                done,
+                message.content.len(),
+                message.tool_calls.len(),
+                preview,
+            );
+        }
+        StreamChunk::Complete {
+            message,
+            done_reason,
+            eval_count,
+            ..
+        } => {
+            let preview: String = message.content.chars().take(240).collect();
+            log::debug!(
+                "ollama chunk complete: done_reason={:?} eval_count={:?} content_len={} tool_calls={} preview={:?}",
+                done_reason,
+                eval_count,
+                message.content.len(),
+                message.tool_calls.len(),
+                preview,
+            );
+            for (i, tc) in message.tool_calls.iter().enumerate() {
+                log::debug!(
+                    "  tool_call[{}] name={} args={}",
+                    i,
+                    tc.function.name,
+                    serde_json::to_string(&tc.function.arguments)
+                        .unwrap_or_else(|_| "<unserializable>".to_string()),
+                );
+            }
+        }
+    }
+}
+
 /// Model info returned by Ollama's /api/tags endpoint.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelInfo {
@@ -324,6 +369,29 @@ impl OllamaClient {
             tools,
         };
 
+        log::debug!(
+            "ollama chat_streaming: model={} messages={} tools={} stream={}",
+            request.model,
+            request.messages.len(),
+            request.tools.len(),
+            use_stream,
+        );
+        for (i, msg) in request.messages.iter().enumerate() {
+            let preview: String = msg.content.chars().take(160).collect();
+            log::debug!(
+                "  msg[{}] role={} tool_calls={} tool_name={:?} content_len={} preview={:?}",
+                i,
+                msg.role,
+                msg.tool_calls.len(),
+                msg.tool_name,
+                msg.content.len(),
+                preview,
+            );
+        }
+        for (i, tool) in request.tools.iter().enumerate() {
+            log::debug!("  tool[{}] name={}", i, tool.function.name);
+        }
+
         let response = self
             .http_client
             .post(format!("{}/api/chat", self.base_url))
@@ -334,6 +402,7 @@ impl OllamaClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
+            log::error!("ollama server error: status={} body={}", status, body);
             return Err(OllamaError::ServerError(format!(
                 "Server returned status {}: {}",
                 status, body
@@ -352,9 +421,16 @@ impl OllamaClient {
                             let line = accumulated.trim();
                             if !line.is_empty() {
                                 match serde_json::from_str::<StreamChunk>(line) {
-                                    Ok(chunk) => return Ok(chunk),
+                                    Ok(chunk) => {
+                                        log_chunk(&chunk);
+                                        return Ok(chunk);
+                                    }
                                     Err(e) => {
-                                        log::debug!("Failed to parse Ollama stream chunk: {}", e);
+                                        log::debug!(
+                                            "Failed to parse Ollama stream chunk: {} line={:?}",
+                                            e,
+                                            line,
+                                        );
                                     }
                                 }
                             }
@@ -367,9 +443,16 @@ impl OllamaClient {
                     let line = accumulated.trim();
                     if !line.is_empty() {
                         match serde_json::from_str::<StreamChunk>(line) {
-                            Ok(chunk) => return Ok(chunk),
+                            Ok(chunk) => {
+                                log_chunk(&chunk);
+                                return Ok(chunk);
+                            }
                             Err(e) => {
-                                log::debug!("Failed to parse Ollama stream chunk: {}", e);
+                                log::debug!(
+                                    "Failed to parse Ollama stream chunk (trailing): {} line={:?}",
+                                    e,
+                                    line,
+                                );
                             }
                         }
                     }

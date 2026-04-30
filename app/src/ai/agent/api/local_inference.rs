@@ -311,6 +311,15 @@ async fn run_ollama(
     let url = ollama_url
         .filter(|u| !u.is_empty())
         .unwrap_or_else(|| ollama::DEFAULT_OLLAMA_URL.to_string());
+    log::debug!(
+        "run_ollama: model={} url={} chat_messages={} task_id={} message_id={} request_id={}",
+        bare_model,
+        url,
+        chat_messages.len(),
+        task_id,
+        message_id,
+        request_id,
+    );
     let client = OllamaClient::with_base_url(&url);
 
     let tool_defs = local_tools::ollama_tool_defs();
@@ -321,8 +330,12 @@ async fn run_ollama(
         .await?;
     let mut stream = Box::pin(stream);
 
+    let mut total_text_len: usize = 0;
+    let mut total_tool_calls: usize = 0;
+
     while let Some(chunk) = stream.next().await {
         if cancellation_rx.try_recv().ok().flatten().is_some() {
+            log::debug!("run_ollama: cancelled by client");
             return Ok(());
         }
         match chunk {
@@ -330,6 +343,7 @@ async fn run_ollama(
             | Ok(ollama::StreamChunk::Complete { message, .. }) => {
                 // Text content (if any)
                 if !message.content.is_empty() {
+                    total_text_len += message.content.len();
                     tx.send(Ok(wrap_actions(vec![
                         api::client_action::Action::AppendToMessageContent(append_action(
                             task_id,
@@ -342,6 +356,11 @@ async fn run_ollama(
                 }
                 // Tool calls
                 if !message.tool_calls.is_empty() {
+                    total_tool_calls += message.tool_calls.len();
+                    log::debug!(
+                        "run_ollama: emitting {} tool call(s) as proto messages",
+                        message.tool_calls.len(),
+                    );
                     let tool_messages =
                         tool_calls_to_proto_messages(&message.tool_calls, task_id, request_id);
                     if !tool_messages.is_empty() {
@@ -355,12 +374,25 @@ async fn run_ollama(
                         ])))
                         .await
                         .map_err(|_| anyhow!("receiver dropped"))?;
+                    } else {
+                        log::warn!(
+                            "run_ollama: {} tool_call(s) received but translated to 0 proto messages (unknown tool names?)",
+                            message.tool_calls.len(),
+                        );
                     }
                 }
             }
-            Err(e) => return Err(anyhow!("ollama stream error: {e}")),
+            Err(e) => {
+                log::error!("run_ollama: stream error: {e}");
+                return Err(anyhow!("ollama stream error: {e}"));
+            }
         }
     }
+    log::debug!(
+        "run_ollama: done. total_text_chars={} total_tool_calls={}",
+        total_text_len,
+        total_tool_calls,
+    );
     Ok(())
 }
 
